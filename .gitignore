@@ -1,0 +1,27 @@
+# Python bytecode & packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.cover
+.coverage
+htmlcov/
+.adversarial-review/
+
+# SQLite runtime databases & WAL shared memory files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Temporary atomic snapshot files
+ui/.snapshot_*.tmp
+
+# OS & editor metadata
+.DS_Store
+.vscode/
+.idea/
