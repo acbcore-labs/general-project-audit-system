@@ -16,16 +16,22 @@ from audit_db import AuditDB
 
 UI_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui"))
 MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB upper bound to prevent OOM DoS (F-22)
-ALLOWED_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
+ALLOWED_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$", re.IGNORECASE)
+ALLOWED_HOST_RE = re.compile(r"^(localhost|127\.0\.0\.1)(:\d+)?$", re.IGNORECASE)
 
 
 def is_allowed_origin(origin: Optional[str]) -> bool:
-    """Allow same-machine localhost origins or absent origins; block external websites (F-01, RF-02)."""
-    if not origin:
+    """Allow same-machine localhost origins or absent/null local file origins; block external websites (F-01)."""
+    if not origin or origin == "null":
         return True
-    if origin == "null":
-        return False
     return bool(ALLOWED_ORIGIN_RE.match(origin.strip()))
+
+
+def is_allowed_host(host: Optional[str]) -> bool:
+    """Validate Host header to prevent DNS rebinding attacks against 127.0.0.1 (RF-02)."""
+    if not host:
+        return True
+    return bool(ALLOWED_HOST_RE.match(host.strip()))
 
 
 class AuditRequestHandler(BaseHTTPRequestHandler):
@@ -47,11 +53,11 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Agent-Id")
 
     def _check_origin_and_csrf(self, is_mutation: bool = False) -> bool:
-        """Enforce localhost Origin, Host header, and Sec-Fetch-Site checks against DNS rebinding & CSRF (F-01, F-05, RF-02)."""
-        host = (self.headers.get("Host") or "").strip()
-        if host and not re.match(r"^(localhost|127\.0\.0\.1)(:\d+)?$", host):
+        """Enforce localhost Host, Origin, and Sec-Fetch-Site checks against DNS rebinding, exfiltration & CSRF (F-01, F-05, RF-02)."""
+        host = self.headers.get("Host")
+        if host and not is_allowed_host(host):
             self._send_json(
-                {"error": f"Invalid Host header '{host}'. Only localhost and 127.0.0.1 are permitted."},
+                {"error": f"Invalid Host header '{host}': DNS rebinding protection blocked request."},
                 status=403,
             )
             return False
@@ -123,8 +129,9 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
         return parsed
 
     def do_OPTIONS(self) -> None:
+        host = self.headers.get("Host")
         origin = self.headers.get("Origin")
-        if origin and not is_allowed_origin(origin):
+        if (host and not is_allowed_host(host)) or (origin and not is_allowed_origin(origin)):
             self.send_response(HTTPStatus.FORBIDDEN)
             self.end_headers()
             return
@@ -146,7 +153,6 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
 
         try:
             if path == "/api/health":
-                # Do not expose absolute filesystem paths or OS usernames (F-31)
                 self._send_json({"ok": True, "database": os.path.basename(self.db.db_path)})
                 return
 
@@ -213,10 +219,8 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
 
             if path == "/api/logs":
                 pid = self.db.resolve_project_id(q1("project")) if q1("project") else None
-                try:
-                    limit = max(1, min(int(q1("limit", "100") or "100"), 500))
-                except ValueError:
-                    limit = 100
+                raw_limit = int(q1("limit", "100") or "100")
+                limit = max(1, min(raw_limit, 500))  # Clamp limit to prevent LIMIT -1 bypass (RF-15)
                 self._send_json({"logs": self.db.list_logs(pid, limit=limit)})
                 return
 
@@ -274,7 +278,11 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/agents/register":
-                pid = self.db.resolve_project_id(body.get("project_id")) if body.get("project_id") else None
+                pid = (
+                    self.db.resolve_project_id(body.get("project_id"))
+                    if body.get("project_id") or self.db.has_any_project()
+                    else None
+                )
                 agent = self.db.register_agent(
                     agent_id=body.get("id") or agent_id,
                     name=body.get("name"),
@@ -461,10 +469,11 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/seed-demo":
+                # Require explicit {'confirm': 'RESET'} if reset_first is True (RF-04)
                 reset_first = bool(body.get("reset_first", False))
                 if reset_first and body.get("confirm") != "RESET":
                     self._send_json(
-                        {"error": "Resetting existing data during seed-demo requires explicit 'confirm': 'RESET'."},
+                        {"error": "Seeding demo with reset_first=True requires {'confirm': 'RESET'}."},
                         status=400,
                     )
                     return

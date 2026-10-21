@@ -160,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_task_block = task_sub.add_parser("block", parents=[sub_global], help="Mark a task as blocked and release its lease")
     p_task_block.add_argument("task_id", help="Task ID")
     p_task_block.add_argument("--reason", default="Blocked during review", help="Reason why the task is blocked")
-    p_task_block.add_argument("--force", action="store_true", help="Force block even if claimed by another agent")
+    p_task_block.add_argument("--force", action="store_true", help="Force block even if claimed by another agent or completed")
 
     p_task_done = task_sub.add_parser("complete", parents=[sub_global], help="Mark a task completed and record deliverable summary")
     p_task_done.add_argument("task_id", help="Task ID")
@@ -205,21 +205,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+def run_cli(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
-        sys.exit(0)
+        return 0
 
     try:
-        # Initialize DB inside try block so --json error contract always holds (F-32)
         db = AuditDB(db_path=args.db)
 
         if args.command == "serve":
             db.ensure_default_project()
             run_server(db, host=args.host, port=args.port)
-            return
+            return 0
 
         if args.command == "init":
             proj = db.create_project(
@@ -230,6 +229,7 @@ def main(argv: list[str] | None = None) -> None:
                 project_id=args.id,
                 agent_id=args.agent,
             )
+            db.sync_static_snapshot(proj["id"])
             print_output(
                 proj,
                 args.json,
@@ -240,10 +240,11 @@ def main(argv: list[str] | None = None) -> None:
                     f"  Database:  {db.db_path}",
                 ],
             )
-            return
+            return 0
 
         if args.command == "seed-demo":
             snap = db.seed_demo_data(reset_first=True)
+            db.sync_static_snapshot(snap["project"]["id"])
             m = snap["metrics"]
             print_output(
                 snap,
@@ -256,13 +257,12 @@ def main(argv: list[str] | None = None) -> None:
                     f"  Findings:   {m['total_findings']} logged ({m['severity_counts']['critical']} critical, {m['severity_counts']['high']} high)",
                 ],
             )
-            return
+            return 0
 
         if args.command == "reset":
-            # Reset tables without pre-creating a dummy project that shadows subsequent 'audit init' (F-12)
             db.reset_database()
             print_output({"ok": True}, args.json, ["Database reset cleanly."])
-            return
+            return 0
 
         if args.command == "status":
             snap = db.get_project_snapshot(args.project)
@@ -283,10 +283,12 @@ def main(argv: list[str] | None = None) -> None:
                 f"[CRIT: {sc['critical']}, HIGH: {sc['high']}, MED: {sc['medium']}, LOW: {sc['low']}, INFO: {sc['info']}]",
             ]
             print_output(snap["metrics"], args.json, lines)
-            return
+            return 0
 
         if args.command == "export":
-            if args.format == "json" or getattr(args, "json", False):
+            # Honor both --format json and global --json flag when exporting to stdout (RF-17)
+            use_json_format = args.format == "json" or (args.json and not args.output)
+            if use_json_format:
                 snap = db.get_project_snapshot(args.project)
                 out_str = json.dumps(snap, indent=2)
             else:
@@ -295,10 +297,14 @@ def main(argv: list[str] | None = None) -> None:
             if args.output:
                 with open(args.output, "w", encoding="utf-8") as f:
                     f.write(out_str)
-                print_output({"ok": True, "output": os.path.abspath(args.output)}, args.json, [f"Exported report to {os.path.abspath(args.output)}"])
+                print_output(
+                    {"ok": True, "output": os.path.abspath(args.output)},
+                    args.json,
+                    [f"Exported report to {os.path.abspath(args.output)}"],
+                )
             else:
                 print(out_str)
-            return
+            return 0
 
         if args.command == "logs":
             pid = db.resolve_project_id(args.project) if args.project else None
@@ -308,12 +314,17 @@ def main(argv: list[str] | None = None) -> None:
                 for l in logs
             ]
             print_output(logs, args.json, lines or ["No audit logs recorded yet."])
-            return
+            return 0
 
         # AGENT SUBCOMMANDS
         if args.command == "agent":
             if args.agent_cmd == "register":
-                pid = db.resolve_project_id(args.project)
+                # Do not auto-create a zombie default project if agent register runs before 'audit init' (RF-19)
+                pid = (
+                    db.resolve_project_id(args.project)
+                    if args.project or db.has_any_project()
+                    else None
+                )
                 aid = args.id or args.agent
                 agent = db.register_agent(
                     agent_id=aid,
@@ -323,6 +334,8 @@ def main(argv: list[str] | None = None) -> None:
                     capabilities=args.capabilities,
                     project_id=pid,
                 )
+                if pid:
+                    db.sync_static_snapshot(pid)
                 print_output(
                     agent,
                     args.json,
@@ -334,7 +347,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"  Heartbeat:    {agent['last_heartbeat']}",
                     ],
                 )
-                return
+                return 0
 
             if args.agent_cmd == "heartbeat":
                 aid = args.id or args.agent
@@ -346,7 +359,7 @@ def main(argv: list[str] | None = None) -> None:
                     args.json,
                     [f"Heartbeat recorded for agent '{agent['id']}' at {agent['last_heartbeat']} (status: {agent['status']})"],
                 )
-                return
+                return 0
 
             if args.agent_cmd == "list":
                 pid = db.resolve_project_id(args.project) if args.project else None
@@ -365,7 +378,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"last seen: {a['last_heartbeat']}{active_str}"
                     )
                 print_output(agents, args.json, lines or ["No agents registered."])
-                return
+                return 0
 
         # SYSTEM SUBCOMMANDS
         if args.command == "system":
@@ -384,6 +397,7 @@ def main(argv: list[str] | None = None) -> None:
                     health_score=args.health,
                     agent_id=args.agent,
                 )
+                db.sync_static_snapshot(pid)
                 print_output(
                     sys_obj,
                     args.json,
@@ -395,7 +409,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"  Updated: {sys_obj['updated_at']}",
                     ],
                 )
-                return
+                return 0
 
             if args.sys_cmd == "list":
                 systems = db.list_systems(pid)
@@ -411,7 +425,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"open findings: {s['open_findings_count']}{claim_tag}"
                     )
                 print_output(systems, args.json, lines or ["No systems mapped yet."])
-                return
+                return 0
 
             if args.sys_cmd == "tree":
                 systems = db.list_systems(pid)
@@ -419,8 +433,12 @@ def main(argv: list[str] | None = None) -> None:
                 for s in systems:
                     by_parent.setdefault(s["parent_id"], []).append(s)
                 lines = []
+                visited_tree = set()
 
                 def walk(node: Dict[str, Any], prefix: str = "", is_last: bool = True) -> None:
+                    if node["id"] in visited_tree:
+                        return
+                    visited_tree.add(node["id"])
                     branch = "└── " if is_last else "├── "
                     health = f"{node['health_score']}/100" if node["health_score"] is not None else "unscored"
                     claim = f" @{node['claimed_by']}" if node.get("claimed_by") else ""
@@ -436,7 +454,7 @@ def main(argv: list[str] | None = None) -> None:
                 for i, r in enumerate(roots):
                     walk(r, "", i == len(roots) - 1)
                 print_output(systems, args.json, lines or ["No systems mapped yet."])
-                return
+                return 0
 
             if args.sys_cmd == "show":
                 s = db.get_system(pid, args.system_ref)
@@ -466,18 +484,19 @@ def main(argv: list[str] | None = None) -> None:
                 for f in s["findings"]:
                     lines.append(f"  - [{f['severity'].upper()}] {f['title']} ({f['status']}) by {f.get('agent_id') or 'unknown'}")
                 print_output(s, args.json, lines)
-                return
+                return 0
 
             if args.sys_cmd == "claim":
                 if not args.agent:
                     raise ValueError("Provide agent ID via --agent or $AUDIT_AGENT_ID")
                 s = db.claim_system(pid, args.system_ref, args.agent, lease_minutes=args.lease, force=args.force)
+                db.sync_static_snapshot(pid)
                 print_output(
                     s,
                     args.json,
                     [f"Agent '{args.agent}' claimed {s['system_type']} '{s['name']}' ({s['slug']}) until {s['lease_until']}"],
                 )
-                return
+                return 0
 
             if args.sys_cmd == "release":
                 s = db.release_system(
@@ -489,12 +508,13 @@ def main(argv: list[str] | None = None) -> None:
                     details_append=args.notes,
                     force=args.force,
                 )
+                db.sync_static_snapshot(pid)
                 print_output(
                     s,
                     args.json,
                     [f"Released '{s['name']}' ({s['slug']}) — status: {s['status']}, health: {s['health_score']}"],
                 )
-                return
+                return 0
 
         # RELATION SUBCOMMANDS
         if args.command == "relation":
@@ -512,6 +532,7 @@ def main(argv: list[str] | None = None) -> None:
                     details=args.details,
                     agent_id=args.agent,
                 )
+                db.sync_static_snapshot(pid)
                 print_output(
                     rel,
                     args.json,
@@ -521,7 +542,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"  Description: {rel['description']}",
                     ],
                 )
-                return
+                return 0
 
             if args.rel_cmd == "list":
                 rels = db.list_relations(pid, system_ref=args.system)
@@ -531,7 +552,7 @@ def main(argv: list[str] | None = None) -> None:
                     for r in rels
                 ]
                 print_output(rels, args.json, lines or ["No cross-system relations recorded."])
-                return
+                return 0
 
         # TASK SUBCOMMANDS
         if args.command == "task":
@@ -548,6 +569,7 @@ def main(argv: list[str] | None = None) -> None:
                     created_by=args.agent,
                     claim_immediately_for=claim_for,
                 )
+                db.sync_static_snapshot(pid)
                 print_output(
                     t,
                     args.json,
@@ -558,7 +580,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"  Claimed:  {t.get('claimed_by') or 'Unclaimed'}",
                     ],
                 )
-                return
+                return 0
 
             if args.task_cmd == "next":
                 if not args.agent:
@@ -570,6 +592,7 @@ def main(argv: list[str] | None = None) -> None:
                     system_ref=args.system,
                     lease_minutes=args.lease,
                 )
+                db.sync_static_snapshot(pid)
                 if not t:
                     print_output({"task": None}, args.json, ["No open tasks matching criteria in queue."])
                 else:
@@ -585,21 +608,23 @@ def main(argv: list[str] | None = None) -> None:
                             f"  Description: {t['description'] or '-'}",
                         ],
                     )
-                return
+                return 0
 
             if args.task_cmd == "claim":
                 if not args.agent:
                     raise ValueError("Provide agent ID via --agent or $AUDIT_AGENT_ID")
                 t = db.claim_task(args.task_id, args.agent, lease_minutes=args.lease, force=args.force)
+                db.sync_static_snapshot(pid)
                 print_output(
                     t,
                     args.json,
                     [f"Agent '{args.agent}' claimed task {t['id']} ('{t['title']}') until {t['lease_until']}"],
                 )
-                return
+                return 0
 
             if args.task_cmd == "block":
-                t = db.block_task(args.task_id, agent_id=args.agent, reason=args.reason, force=getattr(args, "force", False))
+                t = db.block_task(args.task_id, agent_id=args.agent, reason=args.reason, force=args.force)
+                db.sync_static_snapshot(pid)
                 print_output(
                     t,
                     args.json,
@@ -608,7 +633,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"  Reason: {t.get('blocked_reason') or args.reason}",
                     ],
                 )
-                return
+                return 0
 
             if args.task_cmd == "complete":
                 t = db.complete_task(
@@ -619,6 +644,7 @@ def main(argv: list[str] | None = None) -> None:
                     system_health_score=args.health,
                     force=args.force,
                 )
+                db.sync_static_snapshot(pid)
                 print_output(
                     t,
                     args.json,
@@ -628,7 +654,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"  Summary:      {t['deliverable_summary']}",
                     ],
                 )
-                return
+                return 0
 
             if args.task_cmd == "list":
                 tasks = db.list_tasks(
@@ -643,7 +669,7 @@ def main(argv: list[str] | None = None) -> None:
                     for t in tasks
                 ]
                 print_output(tasks, args.json, lines or ["No tasks found."])
-                return
+                return 0
 
         # FINDING SUBCOMMANDS
         if args.command == "finding":
@@ -664,6 +690,7 @@ def main(argv: list[str] | None = None) -> None:
                     line_range=args.lines,
                     recommendation=args.recommendation,
                 )
+                db.sync_static_snapshot(pid)
                 print_output(
                     f,
                     args.json,
@@ -674,7 +701,7 @@ def main(argv: list[str] | None = None) -> None:
                         f"  Agent:    {f.get('agent_id') or 'unspecified'} at {f['created_at']}",
                     ],
                 )
-                return
+                return 0
 
             if args.find_cmd == "update":
                 f = db.update_finding_status(
@@ -683,12 +710,13 @@ def main(argv: list[str] | None = None) -> None:
                     agent_id=args.agent,
                     recommendation=args.recommendation,
                 )
+                db.sync_static_snapshot(pid)
                 print_output(
                     f,
                     args.json,
                     [f"Updated Finding {f['id']} status -> {f['status']} (at {f['updated_at']})"],
                 )
-                return
+                return 0
 
             if args.find_cmd == "list":
                 findings = db.list_findings(
@@ -704,16 +732,21 @@ def main(argv: list[str] | None = None) -> None:
                     for f in findings
                 ]
                 print_output(findings, args.json, lines or ["No findings logged."])
-                return
+                return 0
 
         parser.print_help()
+        return 0
 
     except Exception as exc:
         if getattr(args, "json", False):
             print(json.dumps({"error": str(exc)}, indent=2))
         else:
             print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        return 1
+
+
+def main() -> None:
+    sys.exit(run_cli())
 
 
 if __name__ == "__main__":

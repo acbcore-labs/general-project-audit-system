@@ -217,10 +217,12 @@ function renderSystemsExplorer() {
   };
 
   const html = [];
-  const visitedTreeNodes = new Set();
+  const visitedNodes = new Set();
+
   function renderNode(sys, depth) {
-    if (!sys || visitedTreeNodes.has(sys.id)) return;
-    visitedTreeNodes.add(sys.id);
+    if (visitedNodes.has(sys.id)) return;
+    visitedNodes.add(sys.id);
+
     const children = byParent[sys.id] || [];
     const selfMatch = matchesQuery(sys);
     const childMatches = children.some((c) => matchesQuery(c) || (byParent[c.id] || []).some(matchesQuery));
@@ -238,7 +240,7 @@ function renderSystemsExplorer() {
     html.push(`
       <div class="tree-node ${depth > 0 ? "child-node" : ""} ${isSelected ? "selected" : ""}"
            style="margin-left: ${depth * 16}px"
-           data-action="select-system" data-system-id="${esc(sys.id)}">
+           data-action="select-system" data-id="${esc(sys.id)}">
         <div class="tree-node-top">
           <div class="tree-node-title">
             <span>${depth === 0 ? "📦" : "↳"}</span>
@@ -312,7 +314,7 @@ async function loadAndRenderDossier(systemId) {
             ${s.subsystems
               .map(
                 (sub) => `
-              <div class="rel-card" style="cursor:pointer" data-action="select-system" data-system-id="${esc(sub.id)}">
+              <div class="rel-card" style="cursor:pointer" data-action="select-system" data-id="${esc(sub.id)}">
                 <div class="rel-card-top">
                   <strong>↳ ${esc(sub.name)} <span style="font-family:var(--font-mono);font-weight:400;color:var(--text-muted)">(${esc(sub.slug)})</span></strong>
                   <div style="display:flex;gap:6px">${statusBadge(sub.status)} ${healthBadge(sub.health_score)}</div>
@@ -336,7 +338,7 @@ async function loadAndRenderDossier(systemId) {
                 <span>
                   <strong>${esc(s.name)}</strong>
                   <span class="badge badge-info">${esc(r.relation_type)} ${r.direction === "bidirectional" ? "↔" : "→"}</span>
-                  <button class="link-btn" data-action="select-system" data-system-id="${esc(r.target_system_id)}"><strong>${esc(r.target_name)}</strong></button>
+                  <button class="link-btn" data-action="select-system" data-id="${esc(r.target_system_id)}"><strong>${esc(r.target_name)}</strong></button>
                 </span>
                 ${severityBadge(r.criticality)}
               </div>
@@ -358,7 +360,7 @@ async function loadAndRenderDossier(systemId) {
             <div class="rel-card">
               <div class="rel-card-top">
                 <span>
-                  <button class="link-btn" data-action="select-system" data-system-id="${esc(r.source_system_id)}"><strong>${esc(r.source_name)}</strong></button>
+                  <button class="link-btn" data-action="select-system" data-id="${esc(r.source_system_id)}"><strong>${esc(r.source_name)}</strong></button>
                   <span class="badge badge-info">${esc(r.relation_type)} →</span>
                   <strong>${esc(s.name)}</strong>
                 </span>
@@ -398,7 +400,6 @@ async function loadAndRenderDossier(systemId) {
             )
             .join("");
 
-    // Use ID-based lookups in onclick attributes to prevent stored XSS / entity double-decoding (F-06)
     pane.innerHTML = `
       <div class="dossier-header">
         <div>
@@ -415,13 +416,13 @@ async function loadAndRenderDossier(systemId) {
         <div class="dossier-actions">
           ${
             isClaimed
-              ? `<button class="btn btn-sm btn-secondary" data-action="release-system" data-system-id="${esc(s.id)}">🔓 Release Claim (@${esc(s.claimed_by)})</button>`
-              : `<button class="btn btn-sm btn-secondary" data-action="claim-system" data-system-id="${esc(s.id)}">🔒 Claim for @${esc(state.activeAgentId || "agent")}</button>`
+              ? `<button class="btn btn-sm btn-secondary" data-action="release-system" data-id="${esc(s.id)}">🔓 Release Claim (@${esc(s.claimed_by)})</button>`
+              : `<button class="btn btn-sm btn-secondary" data-action="claim-system" data-id="${esc(s.id)}">🔒 Claim for @${esc(state.activeAgentId || "agent")}</button>`
           }
-          <button class="btn btn-sm" data-action="open-edit-system" data-system-id="${esc(s.id)}">✎ Edit Details</button>
-          <button class="btn btn-sm btn-primary" data-action="open-add-subsystem" data-system-id="${esc(s.id)}">+ Add Subsystem</button>
-          <button class="btn btn-sm btn-accent" data-action="open-add-relation" data-system-slug="${esc(s.slug)}">+ Link Interaction</button>
-          <button class="btn btn-sm btn-danger" data-action="open-add-finding" data-system-slug="${esc(s.slug)}">+ Log Finding</button>
+          <button class="btn btn-sm" data-action="edit-system" data-id="${esc(s.id)}">✎ Edit Details</button>
+          <button class="btn btn-sm btn-primary" data-action="add-subsystem" data-id="${esc(s.id)}">+ Add Subsystem</button>
+          <button class="btn btn-sm btn-accent" data-action="add-relation" data-slug="${esc(s.slug)}">+ Link Interaction</button>
+          <button class="btn btn-sm btn-danger" data-action="add-finding" data-slug="${esc(s.slug)}">+ Log Finding</button>
         </div>
       </div>
 
@@ -434,7 +435,7 @@ async function loadAndRenderDossier(systemId) {
           <span class="meta-label">Parent System</span>
           <span class="meta-val">${
             s.parent
-              ? `<button class="link-btn" data-action="select-system" data-system-id="${esc(s.parent.id)}">${esc(s.parent.name)} (${esc(s.parent.slug)})</button>`
+              ? `<button class="link-btn" data-action="select-system" data-id="${esc(s.parent.id)}">${esc(s.parent.name)} (${esc(s.parent.slug)})</button>`
               : "Top-Level Root System"
           }</span>
         </div>
@@ -466,7 +467,7 @@ async function loadAndRenderDossier(systemId) {
       <div class="dossier-section">
         <div class="dossier-section-header">
           <h4>Child Subsystems (${s.subsystems.length})</h4>
-          <button class="btn btn-xs btn-ghost" data-action="open-add-subsystem" data-system-id="${esc(s.id)}">+ New Subsystem</button>
+          <button class="btn btn-xs btn-ghost" data-action="add-subsystem" data-id="${esc(s.id)}">+ New Subsystem</button>
         </div>
         ${subsystemsHtml}
       </div>
@@ -474,7 +475,7 @@ async function loadAndRenderDossier(systemId) {
       <div class="dossier-section">
         <div class="dossier-section-header">
           <h4>Cross-System Interactions — How "${esc(s.name)}" Works With Other Systems</h4>
-          <button class="btn btn-xs btn-ghost" data-action="open-add-relation" data-system-slug="${esc(s.slug)}">+ Add Interaction</button>
+          <button class="btn btn-xs btn-ghost" data-action="add-relation" data-slug="${esc(s.slug)}">+ Add Interaction</button>
         </div>
         <div class="rel-grid">
           <div>
@@ -491,7 +492,7 @@ async function loadAndRenderDossier(systemId) {
       <div class="dossier-section">
         <div class="dossier-section-header">
           <h4>Audit Findings (${s.findings.length})</h4>
-          <button class="btn btn-xs btn-ghost" data-action="open-add-finding" data-system-slug="${esc(s.slug)}">+ Log Finding</button>
+          <button class="btn btn-xs btn-ghost" data-action="add-finding" data-slug="${esc(s.slug)}">+ Log Finding</button>
         </div>
         <div style="display:flex;flex-direction:column;gap:8px">${findingsHtml}</div>
       </div>
@@ -607,14 +608,14 @@ function renderTopologyTab() {
         (r) => `
         <tr>
           <td>
-            <button class="link-btn" data-action="select-system" data-system-id="${esc(r.source_system_id)}"><strong>${esc(r.source_name)}</strong></button>
+            <button class="link-btn" data-action="select-system" data-id="${esc(r.source_system_id)}"><strong>${esc(r.source_name)}</strong></button>
             <div style="font-size:11px;font-family:var(--font-mono);color:var(--text-dim)">${esc(r.source_slug)} (${esc(r.source_type)})</div>
           </td>
           <td>
             <span class="badge badge-info">${esc(r.relation_type)} ${r.direction === "bidirectional" ? "↔" : "→"}</span>
           </td>
           <td>
-            <button class="link-btn" data-action="select-system" data-system-id="${esc(r.target_system_id)}"><strong>${esc(r.target_name)}</strong></button>
+            <button class="link-btn" data-action="select-system" data-id="${esc(r.target_system_id)}"><strong>${esc(r.target_name)}</strong></button>
             <div style="font-size:11px;font-family:var(--font-mono);color:var(--text-dim)">${esc(r.target_slug)} (${esc(r.target_type)})</div>
           </td>
           <td style="font-family:var(--font-mono);color:var(--accent)">${esc(r.interface_or_protocol || "direct")}</td>
@@ -762,7 +763,7 @@ function renderTopologySvg(systems, relations) {
 
     const healthTxt = sys.health_score !== null ? `${sys.health_score}%` : "—";
     svgParts.push(`
-      <g style="cursor:pointer" data-action="select-system" data-system-id="${esc(sys.id)}">
+      <g style="cursor:pointer" data-action="select-system" data-id="${esc(sys.id)}">
         <rect x="${x}" y="${y}" width="${nodeW}" height="${nodeH}" rx="8" fill="${fill}" stroke="${stroke}" stroke-width="${isRoot ? 2 : 1.3}" />
         <text x="${x + 10}" y="${y + 20}" fill="#f8fafc" font-size="12" font-weight="700">${esc(sys.name.slice(0, 24))}</text>
         <text x="${x + 10}" y="${y + 38}" fill="#94a3b8" font-size="10" font-family="var(--font-mono)">${esc(sys.system_type)} · ${esc(sys.status)}</text>
@@ -823,9 +824,9 @@ function renderWorkforceTab() {
               ${
                 isCurrent
                   ? `<span class="badge badge-low" style="flex:1;justify-content:center">✓ Acting Identity</span>`
-                  : `<button class="btn btn-xs" style="flex:1;justify-content:center" data-action="set-active-agent" data-agent-id="${esc(a.id)}">Act as @${esc(a.id)}</button>`
+                  : `<button class="btn btn-xs" style="flex:1;justify-content:center" data-action="set-active-agent" data-id="${esc(a.id)}">Act as @${esc(a.id)}</button>`
               }
-              <button class="btn btn-xs btn-ghost" data-action="heartbeat-agent" data-agent-id="${esc(a.id)}">♥ Heartbeat</button>
+              <button class="btn btn-xs btn-ghost" data-action="send-heartbeat" data-id="${esc(a.id)}">♥ Heartbeat</button>
             </div>
           </div>
         `;
@@ -854,7 +855,7 @@ function renderWorkforceTab() {
       ${t.description ? `<div style="font-size:12px;color:var(--text-muted)">${esc(t.description)}</div>` : ""}
       ${t.blocked_reason && t.status === "blocked" ? `<div style="font-size:11.5px;color:#fda4af"><strong>Blocked:</strong> ${esc(t.blocked_reason)}</div>` : ""}
       <div style="font-size:11.5px;font-family:var(--font-mono);color:var(--accent)">
-        Target: ${t.system_name ? `<button class="link-btn" data-action="select-system" data-system-id="${esc(t.system_id)}">${esc(t.system_name)}</button>` : "Project-wide"}
+        Target: ${t.system_name ? `<button class="link-btn" data-action="select-system" data-id="${esc(t.system_id)}">${esc(t.system_name)}</button>` : "Project-wide"}
       </div>
       ${
         t.claimed_by
@@ -872,13 +873,13 @@ function renderWorkforceTab() {
       <div style="display:flex;gap:6px;margin-top:4px;flex-wrap:wrap">
         ${
           t.status === "open" || t.status === "blocked"
-            ? `<button class="btn btn-xs btn-secondary" data-action="claim-task" data-task-id="${esc(t.id)}">🔒 Claim Task</button>`
+            ? `<button class="btn btn-xs btn-secondary" data-action="claim-task" data-id="${esc(t.id)}">🔒 Claim Task</button>`
             : ""
         }
         ${
           t.status === "claimed"
-            ? `<button class="btn btn-xs btn-primary" data-action="complete-task" data-task-id="${esc(t.id)}">✓ Complete</button>
-               <button class="btn btn-xs btn-danger" data-action="block-task" data-task-id="${esc(t.id)}">⊘ Block</button>`
+            ? `<button class="btn btn-xs btn-primary" data-action="complete-task" data-id="${esc(t.id)}">✓ Complete</button>
+               <button class="btn btn-xs btn-danger" data-action="block-task" data-id="${esc(t.id)}">⊘ Block</button>`
             : ""
         }
       </div>
@@ -993,6 +994,7 @@ window.blockTaskPromptById = function (taskId) {
           task_id: taskId,
           agent_id: state.activeAgentId,
           reason: fd.get("reason"),
+          force: true,
         }),
       });
       showToast(`Blocked task ${taskId}`);
@@ -1039,7 +1041,7 @@ function renderFindingsTab() {
             <span class="finding-title">${esc(f.title)}</span>
           </div>
           <div style="display:flex;align-items:center;gap:8px">
-            <select data-action="update-finding-status" data-finding-id="${esc(f.id)}" style="padding:3px 8px;font-size:12px">
+            <select data-action="update-finding-status" data-id="${esc(f.id)}" style="padding:3px 8px;font-size:12px">
               ${["open", "confirmed", "mitigated", "resolved", "wont_fix"]
                 .map((opt) => `<option value="${opt}" ${f.status === opt ? "selected" : ""}>Status: ${opt}</option>`)
                 .join("")}
@@ -1050,12 +1052,12 @@ function renderFindingsTab() {
         <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;font-size:12px">
           <span><strong>System:</strong> ${
             f.system_id
-              ? `<button class="link-btn" data-action="select-system" data-system-id="${esc(f.system_id)}">${esc(f.system_name)} (${esc(f.system_slug)})</button>`
+              ? `<button class="link-btn" data-action="select-system" data-id="${esc(f.system_id)}">${esc(f.system_name)} (${esc(f.system_slug)})</button>`
               : "Project-wide"
           }</span>
           ${
             f.related_system_id
-              ? `<span><strong>Works With / Affects:</strong> <button class="link-btn" data-action="select-system" data-system-id="${esc(f.related_system_id)}">${esc(f.related_system_name)}</button></span>`
+              ? `<span><strong>Works With / Affects:</strong> <button class="link-btn" data-action="select-system" data-id="${esc(f.related_system_id)}">${esc(f.related_system_name)}</button></span>`
               : ""
           }
           ${f.file_path ? `<span class="finding-loc">${esc(f.file_path)}${f.line_range ? ":" + esc(f.line_range) : ""}</span>` : ""}
@@ -1212,7 +1214,7 @@ window.openRegisterAgentModal = function () {
       <div class="form-row-2">
         <div class="form-row">
           <label>Agent ID (unique slug) *</label>
-          <input type="text" name="id" required placeholder="e.g. agent-sec-01" />
+          <input type="text" name="id" required pattern="[a-zA-Z0-9_-]{1,64}" placeholder="e.g. agent-sec-01" />
         </div>
         <div class="form-row">
           <label>Display Name *</label>
@@ -1278,7 +1280,7 @@ window.openAddSystemModal = function (parentId = "", parentName = "") {
         </div>
         <div class="form-row">
           <label>Slug (optional)</label>
-          <input type="text" name="slug" placeholder="auto-generated if blank" />
+          <input type="text" name="slug" pattern="[a-zA-Z0-9_-]{1,64}" placeholder="auto-generated if blank" />
         </div>
       </div>
       <div class="form-row-2">
@@ -1636,7 +1638,7 @@ window.openAddFindingModal = function (defaultSystemRef = "") {
 };
 
 /* =========================================================================
-   EVENT LISTENERS & INITIALIZATION
+   EVENT LISTENERS & DELEGATED DOM HANDLERS (RF-03)
    ========================================================================= */
 function switchTab(tabName) {
   state.activeTab = tabName;
@@ -1649,6 +1651,63 @@ function switchTab(tabName) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  // Delegated click handler for all dynamic UI elements (eliminates inline onclick XSS vectors - RF-03)
+  document.addEventListener("click", (e) => {
+    const target = e.target.closest("[data-action]");
+    if (!target) return;
+    const action = target.dataset.action;
+    const id = target.dataset.id || "";
+    const slug = target.dataset.slug || "";
+
+    switch (action) {
+      case "select-system":
+        selectSystem(id);
+        break;
+      case "claim-system":
+        claimSystemAction(id);
+        break;
+      case "release-system":
+        releaseSystemPromptById(id);
+        break;
+      case "edit-system":
+        openEditSystemModalById(id);
+        break;
+      case "add-subsystem":
+        openAddSystemModalById(id);
+        break;
+      case "add-relation":
+        openAddRelationModal(slug);
+        break;
+      case "add-finding":
+        openAddFindingModal(slug);
+        break;
+      case "set-active-agent":
+        setActiveAgent(id);
+        break;
+      case "send-heartbeat":
+        sendAgentHeartbeat(id);
+        break;
+      case "claim-task":
+        claimTaskAction(id);
+        break;
+      case "complete-task":
+        completeTaskPromptById(id);
+        break;
+      case "block-task":
+        blockTaskPromptById(id);
+        break;
+      default:
+        break;
+    }
+  });
+
+  // Delegated change handler for dynamic selects
+  document.addEventListener("change", (e) => {
+    const target = e.target.closest("[data-action='update-finding-status']");
+    if (!target) return;
+    updateFindingStatusAction(target.dataset.id, target.value);
+  });
+
   document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
@@ -1736,71 +1795,6 @@ document.addEventListener("DOMContentLoaded", () => {
       closeModal();
     } catch (err) {
       showToast(`Error: ${err.message}`);
-    }
-  });
-
-  document.addEventListener("click", (e) => {
-    const actionEl = e.target.closest("[data-action]");
-    if (!actionEl) return;
-    const action = actionEl.dataset.action;
-    if (action === "select-system") {
-      e.preventDefault();
-      const id = actionEl.dataset.systemId;
-      if (id && window.selectSystem) window.selectSystem(id);
-    } else if (action === "claim-system") {
-      e.preventDefault();
-      const id = actionEl.dataset.systemId;
-      if (id && window.claimSystemAction) window.claimSystemAction(id);
-    } else if (action === "release-system") {
-      e.preventDefault();
-      const id = actionEl.dataset.systemId;
-      if (id && window.releaseSystemPromptById) window.releaseSystemPromptById(id);
-    } else if (action === "open-edit-system") {
-      e.preventDefault();
-      const id = actionEl.dataset.systemId;
-      if (id && window.openEditSystemModalById) window.openEditSystemModalById(id);
-    } else if (action === "open-add-subsystem") {
-      e.preventDefault();
-      const id = actionEl.dataset.systemId;
-      if (id && window.openAddSystemModalById) window.openAddSystemModalById(id);
-    } else if (action === "open-add-relation") {
-      e.preventDefault();
-      const slug = actionEl.dataset.systemSlug;
-      if (window.openAddRelationModal) window.openAddRelationModal(slug || "");
-    } else if (action === "open-add-finding") {
-      e.preventDefault();
-      const slug = actionEl.dataset.systemSlug;
-      if (window.openAddFindingModal) window.openAddFindingModal(slug || "");
-    } else if (action === "set-active-agent") {
-      e.preventDefault();
-      const id = actionEl.dataset.agentId;
-      if (id && window.setActiveAgent) window.setActiveAgent(id);
-    } else if (action === "heartbeat-agent") {
-      e.preventDefault();
-      const id = actionEl.dataset.agentId;
-      if (id && window.sendAgentHeartbeat) window.sendAgentHeartbeat(id);
-    } else if (action === "claim-task") {
-      e.preventDefault();
-      const id = actionEl.dataset.taskId;
-      if (id && window.claimTaskAction) window.claimTaskAction(id);
-    } else if (action === "complete-task") {
-      e.preventDefault();
-      const id = actionEl.dataset.taskId;
-      if (id && window.completeTaskPromptById) window.completeTaskPromptById(id);
-    } else if (action === "block-task") {
-      e.preventDefault();
-      const id = actionEl.dataset.taskId;
-      if (id && window.blockTaskPromptById) window.blockTaskPromptById(id);
-    }
-  });
-
-  document.addEventListener("change", (e) => {
-    const actionEl = e.target.closest("[data-action='update-finding-status']");
-    if (actionEl) {
-      const findingId = actionEl.dataset.findingId;
-      if (findingId && window.updateFindingStatusAction) {
-        window.updateFindingStatusAction(findingId, actionEl.value);
-      }
     }
   });
 

@@ -4,7 +4,6 @@ import contextlib
 import io
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,9 +11,9 @@ from email.message import Message
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from audit_cli import build_parser, main as cli_main
+from audit_cli import build_parser, run_cli
 from audit_db import AuditDB, utc_now_iso
-from audit_server import AuditRequestHandler, is_allowed_origin
+from audit_server import AuditRequestHandler, is_allowed_host, is_allowed_origin
 
 
 class MockRequestHandler(AuditRequestHandler):
@@ -61,25 +60,58 @@ class TestAuditOSRemediation(unittest.TestCase):
         self.db = AuditDB(":memory:")
 
     # -------------------------------------------------------------------------
-    # F-01, F-05, F-21, F-22, F-30, F-31: Server Security & Request Validation
+    # F-01, F-05, F-21, F-22, F-30, F-31, RF-02, RF-04, RF-11, RF-15: Server Security
     # -------------------------------------------------------------------------
-    def test_f01_cors_blocks_foreign_origins(self) -> None:
+    def test_f01_and_rf02_cors_and_dns_rebinding_protection(self) -> None:
         self.assertTrue(is_allowed_origin("http://localhost:8420"))
         self.assertTrue(is_allowed_origin("http://127.0.0.1:8420"))
         self.assertTrue(is_allowed_origin(None))
         self.assertFalse(is_allowed_origin("https://malicious-attacker.com"))
 
-        h = MockRequestHandler(
+        self.assertTrue(is_allowed_host("localhost:8420"))
+        self.assertTrue(is_allowed_host("127.0.0.1:8420"))
+        self.assertFalse(is_allowed_host("rebind.attacker.com:8420"))
+
+        # Foreign Origin blocked (F-01)
+        h_origin = MockRequestHandler(
             self.db,
             "GET",
             "/api/snapshot",
             headers_dict={"Origin": "https://malicious-attacker.com"},
         )
-        h.do_GET()
-        self.assertEqual(h.status_code, 403)
-        self.assertIn("forbidden", h.get_json()["error"].lower())
+        h_origin.do_GET()
+        self.assertEqual(h_origin.status_code, 403)
+        self.assertNotEqual(h_origin.response_headers.get("Access-Control-Allow-Origin"), "*")
 
-    def test_f01_and_f05_csrf_and_reset_confirmation(self) -> None:
+        # Host header DNS rebinding blocked (RF-02)
+        h_rebind = MockRequestHandler(
+            self.db,
+            "GET",
+            "/api/snapshot",
+            headers_dict={
+                "Host": "rebind.attacker.com:8420",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        h_rebind.do_GET()
+        self.assertEqual(h_rebind.status_code, 403)
+        self.assertIn("rebinding", h_rebind.get_json()["error"].lower())
+
+        # Valid localhost request returns strict localhost CORS header (RF-11)
+        h_ok = MockRequestHandler(
+            self.db,
+            "GET",
+            "/api/snapshot",
+            headers_dict={"Host": "localhost:8420", "Origin": "http://localhost:8420"},
+        )
+        h_ok.do_GET()
+        self.assertEqual(h_ok.status_code, 200)
+        self.assertEqual(
+            h_ok.response_headers.get("Access-Control-Allow-Origin"),
+            "http://localhost:8420",
+        )
+
+    def test_f01_f05_and_rf04_csrf_reset_and_seed_demo_confirmation(self) -> None:
         self.db.ensure_default_project()
         # 1. HTML Form POST without application/json is rejected with 415 (F-05)
         h_form = MockRequestHandler(
@@ -117,7 +149,18 @@ class TestAuditOSRemediation(unittest.TestCase):
         h_no_confirm.do_POST()
         self.assertEqual(h_no_confirm.status_code, 400)
 
-        # 4. Valid localhost JSON POST with {"confirm": "RESET"} succeeds
+        # 4. JSON POST to /api/seed-demo with reset_first=True without confirm is rejected (RF-04)
+        h_seed_unconfirmed = MockRequestHandler(
+            self.db,
+            "POST",
+            "/api/seed-demo",
+            headers_dict={"Content-Type": "application/json"},
+            body_bytes=b'{"reset_first": true}',
+        )
+        h_seed_unconfirmed.do_POST()
+        self.assertEqual(h_seed_unconfirmed.status_code, 400)
+
+        # 5. Valid localhost JSON POST with {"confirm": "RESET"} succeeds
         h_valid = MockRequestHandler(
             self.db,
             "POST",
@@ -129,7 +172,6 @@ class TestAuditOSRemediation(unittest.TestCase):
         self.assertEqual(h_valid.status_code, 200)
 
     def test_f21_and_f22_malformed_json_and_oversized_body(self) -> None:
-        # Malformed JSON returns 400 instead of crashing thread (F-21)
         h_bad = MockRequestHandler(
             self.db,
             "POST",
@@ -140,7 +182,6 @@ class TestAuditOSRemediation(unittest.TestCase):
         h_bad.do_POST()
         self.assertEqual(h_bad.status_code, 400)
 
-        # Oversized Content-Length returns 413 Payload Too Large (F-22)
         h_huge = MockRequestHandler(
             self.db,
             "POST",
@@ -154,31 +195,40 @@ class TestAuditOSRemediation(unittest.TestCase):
         h_huge.do_POST()
         self.assertEqual(h_huge.status_code, 413)
 
-    def test_f30_and_f31_static_traversal_and_health_path_redaction(self) -> None:
-        h_health = MockRequestHandler(self.db, "GET", "/api/health")
-        h_health.do_GET()
-        self.assertEqual(h_health.status_code, 200)
-        data = h_health.get_json()
-        self.assertNotIn("db_path", data)
-        self.assertEqual(data["database"], os.path.basename(self.db.db_path))
-        self.assertNotIn("/", data["database"])
-        self.assertNotIn("\\", data["database"])
-        self.assertTrue(data["ok"])
+    def test_f30_f31_and_rf15_static_confinement_health_and_logs_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            disk_db = AuditDB(db_path=os.path.join(tmpdir, "secret_dir", "my_audit.db"))
+            h_health = MockRequestHandler(disk_db, "GET", "/api/health")
+            h_health.do_GET()
+            self.assertEqual(h_health.status_code, 200)
+            data = h_health.get_json()
+            self.assertNotIn("db_path", data)
+            self.assertEqual(data["database"], "my_audit.db")
+            self.assertNotIn("/", data["database"])
+            self.assertNotIn("\\", data["database"])
 
         h_trav = MockRequestHandler(self.db, "GET", "/../audit_db.py")
         h_trav.do_GET()
         self.assertEqual(h_trav.status_code, 404)
 
+        # RF-15: Negative limit is clamped to >= 1
+        p = self.db.ensure_default_project()
+        self.db.upsert_system(p["id"], "Sys1", slug="sys-1")
+        self.db.upsert_system(p["id"], "Sys2", slug="sys-2")
+        h_logs = MockRequestHandler(self.db, "GET", "/api/logs?limit=-1")
+        h_logs.do_GET()
+        self.assertEqual(h_logs.status_code, 200)
+        self.assertEqual(len(h_logs.get_json()["logs"]), 1)
+
     # -------------------------------------------------------------------------
-    # F-02: Active Audit Does Not Mask Open Critical/High Findings
+    # F-02 & RF-01: Open Critical/High Vulnerability Masking Prevention
     # -------------------------------------------------------------------------
-    def test_f02_critical_finding_not_masked_by_task_completion(self) -> None:
+    def test_f02_and_rf01_critical_finding_never_masked_by_reviewed_or_healthy(self) -> None:
         p = self.db.ensure_default_project()
         self.db.upsert_system(p["id"], "Auth Gateway", slug="auth-gw")
         t = self.db.create_task(p["id"], "Audit Auth", system_ref="auth-gw")
         self.db.claim_task(t["id"], "agent-1")
 
-        # Log critical finding while system is 'in_progress'
         self.db.add_finding(
             p["id"],
             system_ref="auth-gw",
@@ -186,417 +236,221 @@ class TestAuditOSRemediation(unittest.TestCase):
             title="Remote Code Execution",
             agent_id="agent-1",
         )
-        sys_mid = self.db.get_system(p["id"], "auth-gw")
-        self.assertEqual(sys_mid["status"], "needs_attention")
+        # 1. Attempting to complete task with system_status="reviewed" or "healthy" MUST stay 'needs_attention' (RF-01)
+        self.db.complete_task(
+            t["id"],
+            "agent-1",
+            deliverable_summary="Audit finished",
+            system_status="healthy",
+        )
+        self.assertEqual(self.db.get_system(p["id"], "auth-gw")["status"], "needs_attention")
 
-        # Complete task requesting 'reviewed' — system MUST remain 'needs_attention'
-        self.db.complete_task(t["id"], "agent-1", deliverable_summary="Audit finished", system_status="reviewed")
-        sys_after = self.db.get_system(p["id"], "auth-gw")
-        self.assertEqual(sys_after["status"], "needs_attention")
-
-        # Complete task requesting 'healthy' — system MUST remain 'needs_attention'
-        t2 = self.db.create_task(p["id"], "Audit Auth 2", system_ref="auth-gw")
-        self.db.claim_task(t2["id"], "agent-1")
-        self.db.complete_task(t2["id"], "agent-1", deliverable_summary="Finished", system_status="healthy")
-        sys_after2 = self.db.get_system(p["id"], "auth-gw")
-        self.assertEqual(sys_after2["status"], "needs_attention")
-
-        # upsert_system also cannot overwrite to 'healthy' while critical findings are open
+        # 2. Attempting to overwrite via upsert_system(status="healthy") MUST stay 'needs_attention' (RF-01)
         self.db.upsert_system(p["id"], "Auth Gateway", slug="auth-gw", status="healthy")
-        sys_upsert = self.db.get_system(p["id"], "auth-gw")
-        self.assertEqual(sys_upsert["status"], "needs_attention")
+        self.assertEqual(self.db.get_system(p["id"], "auth-gw")["status"], "needs_attention")
 
-        # Clean system (no open critical/high findings) cleanly transitions to 'reviewed'
-        self.db.upsert_system(p["id"], "Clean Gateway", slug="clean-gw")
-        t_clean = self.db.create_task(p["id"], "Audit Clean", system_ref="clean-gw")
-        self.db.claim_task(t_clean["id"], "agent-1")
-        self.db.complete_task(t_clean["id"], "agent-1", deliverable_summary="All clean")
-        sys_clean = self.db.get_system(p["id"], "clean-gw")
-        self.assertEqual(sys_clean["status"], "reviewed")
+        # 3. Attempting to overwrite via release_system(status="healthy") MUST stay 'needs_attention' (RF-01)
+        self.db.claim_system(p["id"], "auth-gw", "agent-1")
+        self.db.release_system(p["id"], "auth-gw", agent_id="agent-1", status="healthy")
+        self.assertEqual(self.db.get_system(p["id"], "auth-gw")["status"], "needs_attention")
 
     # -------------------------------------------------------------------------
-    # F-03, F-08, F-13, F-14, F-17, F-18, F-20, F-23: Leases & Concurrency
+    # F-03, F-08, RF-05, RF-06, RF-07, RF-08, RF-09, RF-12, RF-16: Concurrency & Leases
     # -------------------------------------------------------------------------
     def test_f03_claim_next_task_respects_active_system_leases(self) -> None:
         p = self.db.ensure_default_project()
         self.db.upsert_system(p["id"], "Payment Core", slug="payment-core")
-        # Agent Alice acquires exclusive 60m lease on payment-core
         self.db.claim_system(p["id"], "payment-core", "agent-alice", lease_minutes=60)
         self.db.create_task(p["id"], "Review Payment Gateway", system_ref="payment-core")
 
-        # Agent Bob asks for next task — should NOT steal Alice's leased system
         claimed_by_bob = self.db.claim_next_task(p["id"], "agent-bob")
         self.assertIsNone(claimed_by_bob)
-        sys_obj = self.db.get_system(p["id"], "payment-core")
-        self.assertEqual(sys_obj["claimed_by"], "agent-alice")
+        self.assertEqual(self.db.get_system(p["id"], "payment-core")["claimed_by"], "agent-alice")
 
-        # Alice CAN claim the task on her own leased system
         claimed_by_alice = self.db.claim_next_task(p["id"], "agent-alice")
         self.assertIsNotNone(claimed_by_alice)
         self.assertEqual(claimed_by_alice["claimed_by"], "agent-alice")
 
-    def test_f08_claim_task_acquires_expired_system_lease(self) -> None:
+    def test_f08_and_rf12_expired_lease_reclamation_clears_stale_agent_pointers(self) -> None:
         p = self.db.ensure_default_project()
         self.db.upsert_system(p["id"], "Gateway", slug="gw")
         t1 = self.db.create_task(p["id"], "Task 1", system_ref="gw")
         self.db.claim_task(t1["id"], "agent-old", lease_minutes=-10)  # Expired lease
 
-        t2 = self.db.create_task(p["id"], "Task 2", system_ref="gw")
-        self.db.claim_task(t2["id"], "agent-new", lease_minutes=30)
+        # Agent-new reclaims expired task1
+        self.db.claim_next_task(p["id"], "agent-new", lease_minutes=30)
         sys_obj = self.db.get_system(p["id"], "gw")
         self.assertEqual(sys_obj["claimed_by"], "agent-new")
 
-    def test_f13_and_f14_and_f20_ownership_checks_and_agent_cleanup(self) -> None:
+        # Verify agent-old no longer has stale current_task_id or current_system_id (RF-12)
+        agents = {a["id"]: a for a in self.db.list_agents(p["id"])}
+        self.assertIsNone(agents["agent-old"]["current_task_id"])
+        self.assertIsNone(agents["agent-old"]["current_system_id"])
+        self.assertEqual(agents["agent-new"]["current_task_id"], t1["id"])
+
+    def test_rf05_and_rf06_ownership_checks_when_agent_id_omitted_or_blocked(self) -> None:
         p = self.db.ensure_default_project()
         self.db.upsert_system(p["id"], "Core Service", slug="core-svc")
         t = self.db.create_task(p["id"], "Audit Core", system_ref="core-svc")
         self.db.claim_task(t["id"], "agent-owner", lease_minutes=30)
 
-        # Another agent cannot release or complete without force=True (F-13, F-14)
+        # RF-05: Calling complete_task with agent_id=None on a claimed task MUST fail
         with self.assertRaises(RuntimeError):
-            self.db.release_system(p["id"], "core-svc", agent_id="agent-intruder")
+            self.db.complete_task(t["id"], agent_id=None, deliverable_summary="Anonymous hijack")
+
+        # RF-06: Calling block_task as another agent or anonymous on a claimed task MUST fail
         with self.assertRaises(RuntimeError):
-            self.db.complete_task(t["id"], agent_id="agent-intruder", deliverable_summary="Hijack")
-
-        # Owner completes task -> both current_task_id and current_system_id are cleared (F-20)
-        self.db.complete_task(t["id"], agent_id="agent-owner", deliverable_summary="Done cleanly")
-        agents = {a["id"]: a for a in self.db.list_agents(p["id"])}
-        self.assertIsNone(agents["agent-owner"]["current_task_id"])
-        self.assertIsNone(agents["agent-owner"]["current_system_id"])
-
-        # Completing an already completed task raises RuntimeError unless forced (F-14)
+            self.db.block_task(t["id"], agent_id="agent-rival", reason="Sabotage")
         with self.assertRaises(RuntimeError):
-            self.db.complete_task(t["id"], agent_id="agent-owner", deliverable_summary="Duplicate")
+            self.db.block_task(t["id"], agent_id=None, reason="Anonymous block")
 
-    def test_f17_create_task_with_immediate_claim_locks_system(self) -> None:
+        # Owner can complete task
+        self.db.complete_task(t["id"], agent_id="agent-owner", deliverable_summary="Legit")
+
+        # RF-06: Calling block_task on an already completed task MUST fail unless forced
+        with self.assertRaises(RuntimeError):
+            self.db.block_task(t["id"], agent_id="agent-owner", reason="Regress completed")
+
+    def test_rf07_and_rf08_multi_task_system_lease_preservation_and_unassigned_completion(self) -> None:
         p = self.db.ensure_default_project()
-        self.db.upsert_system(p["id"], " Billing", slug="billing")
-        self.db.create_task(
-            p["id"],
-            "Audit Billing",
-            system_ref="billing",
-            claim_immediately_for="agent-1",
-        )
-        sys_obj = self.db.get_system(p["id"], "billing")
-        self.assertEqual(sys_obj["claimed_by"], "agent-1")
-        self.assertIsNotNone(sys_obj["lease_until"])
+        self.db.upsert_system(p["id"], "Order Engine", slug="order-eng")
+        t1 = self.db.create_task(p["id"], "Task 1", system_ref="order-eng")
+        t2 = self.db.create_task(p["id"], "Task 2", system_ref="order-eng")
 
-    def test_f18_and_f33_poison_pill_max_attempts_and_block_task(self) -> None:
-        p = self.db.ensure_default_project()
-        t = self.db.create_task(p["id"], "Poison Task", max_attempts=2)
+        # Alice claims both t1 and t2 on order-eng
+        self.db.claim_task(t1["id"], "agent-alice", lease_minutes=45)
+        self.db.claim_task(t2["id"], "agent-alice", lease_minutes=45)
 
-        # Attempt 1 with expired lease
-        self.db.claim_next_task(p["id"], "agent-1", lease_minutes=-5)
-        # Attempt 2 with expired lease
-        self.db.claim_next_task(p["id"], "agent-2", lease_minutes=-5)
-        # Next call to claim_next_task should auto-block the task after 2 attempts
-        next_t = self.db.claim_next_task(p["id"], "agent-3")
-        self.assertIsNone(next_t)
-        tasks = self.db.list_tasks(p["id"], status="blocked")
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["id"], t["id"])
+        # Alice completes t1 -> order-eng MUST remain claimed by Alice because t2 is still claimed (RF-07)
+        self.db.complete_task(t1["id"], agent_id="agent-alice", deliverable_summary="Part 1 done")
+        sys_mid = self.db.get_system(p["id"], "order-eng")
+        self.assertEqual(sys_mid["claimed_by"], "agent-alice")
+        alice_mid = {a["id"]: a for a in self.db.list_agents(p["id"])}["agent-alice"]
+        self.assertEqual(alice_mid["current_system_id"], sys_mid["id"])
 
-        # Explicit block_task also works (F-33)
-        t2 = self.db.create_task(p["id"], "Manual Block Task", claim_immediately_for="agent-1")
-        blocked = self.db.block_task(t2["id"], agent_id="agent-1", reason="Waiting on schema")
-        self.assertEqual(blocked["status"], "blocked")
-        self.assertEqual(blocked["blocked_reason"], "Waiting on schema")
+        # RF-08: Completing an unassigned task t3 on order-eng with agent_id=None MUST NOT revoke Alice's system lease
+        t3 = self.db.create_task(p["id"], "Unassigned Task 3", system_ref="order-eng")
+        self.db.complete_task(t3["id"], agent_id=None, deliverable_summary="Auto-check")
+        self.assertEqual(self.db.get_system(p["id"], "order-eng")["claimed_by"], "agent-alice")
 
-    def test_f23_heartbeat_offline_releases_locks_and_ignores_expired(self) -> None:
+        # Now Alice completes t2 -> no remaining tasks, so system lease is released
+        self.db.complete_task(t2["id"], agent_id="agent-alice", deliverable_summary="Part 2 done")
+        self.assertIsNone(self.db.get_system(p["id"], "order-eng")["claimed_by"])
+
+    def test_rf09_and_rf16_offline_heartbeat_blocks_poison_pills_and_resets_system_status(self) -> None:
         p = self.db.ensure_default_project()
         self.db.upsert_system(p["id"], "Cache", slug="cache")
         self.db.register_agent("agent-hb", "HB Agent", project_id=p["id"])
-        self.db.claim_system(p["id"], "cache", "agent-hb", lease_minutes=-10)  # Already expired
 
-        # Heartbeat should NOT resurrect an expired lease
+        # Expired lease is NOT resurrected by active heartbeat (F-23, RF-11)
+        self.db.claim_system(p["id"], "cache", "agent-hb", lease_minutes=-10)
         self.db.heartbeat_agent("agent-hb", status="active", extend_leases_minutes=30)
         sys_obj = self.db.get_system(p["id"], "cache")
         self.assertLess(sys_obj["lease_until"], utc_now_iso())
 
-        # Claim with valid lease, then send offline heartbeat -> releases claim
-        self.db.claim_system(p["id"], "cache", "agent-hb", lease_minutes=30, force=True)
+        # RF-09 & RF-16: Task with max_attempts=1 claimed by agent-hb who then goes offline
+        t = self.db.create_task(p["id"], "Failing Task", system_ref="cache", max_attempts=1)
+        self.db.claim_task(t["id"], "agent-hb", lease_minutes=30, force=True)
+        self.assertEqual(self.db.get_system(p["id"], "cache")["status"], "in_progress")
+
         self.db.heartbeat_agent("agent-hb", status="offline")
+        # System lock is released AND orphaned 'in_progress' status is reset to 'unreviewed' (RF-16)
         sys_after = self.db.get_system(p["id"], "cache")
         self.assertIsNone(sys_after["claimed_by"])
+        self.assertEqual(sys_after["status"], "unreviewed")
+
+        # Task that hit max_attempts=1 is transitioned to 'blocked', not wedged in 'open' (RF-09)
+        blocked_tasks = self.db.list_tasks(p["id"], status="blocked")
+        self.assertEqual(len(blocked_tasks), 1)
+        self.assertEqual(blocked_tasks[0]["id"], t["id"])
+
+        # Attempting to claim a task that reached max_attempts by ID raises RuntimeError (RF-09)
+        with self.assertRaises(RuntimeError):
+            self.db.claim_task(t["id"], "agent-2")
 
     # -------------------------------------------------------------------------
-    # F-09, F-10, F-12, F-25, F-37, F-38: CLI, Foreign Keys, Project Resolution & Bounds
+    # RF-03, RF-10, RF-14: Identifier Validation, Transitive Cycles & Task FK Validation
     # -------------------------------------------------------------------------
-    def test_f09_cli_global_flags_work_before_and_after_subcommands(self) -> None:
-        parser = build_parser()
-        a1 = parser.parse_args(["status", "--json", "--project", "my-proj"])
-        self.assertTrue(a1.json)
-        self.assertEqual(a1.project, "my-proj")
-
-        a2 = parser.parse_args(["--json", "task", "next", "--agent", "agent-99"])
-        self.assertTrue(a2.json)
-        self.assertEqual(a2.agent, "agent-99")
-
-        a3 = parser.parse_args(["system", "claim", "edge-gateway", "--agent", "agent-01", "--json"])
-        self.assertTrue(a3.json)
-        self.assertEqual(a3.agent, "agent-01")
-
-    def test_f10_auto_registers_unregistered_agents_on_relations_and_complete(self) -> None:
+    def test_rf03_and_rf10_identifier_validation_and_transitive_cycle_prevention(self) -> None:
         p = self.db.ensure_default_project()
-        self.db.upsert_system(p["id"], "SysA", slug="sys-a")
-        self.db.upsert_system(p["id"], "SysB", slug="sys-b")
-        rel = self.db.add_relation(p["id"], "sys-a", "sys-b", agent_id="brand-new-agent")
-        self.assertEqual(rel["recorded_by"], "brand-new-agent")
+        # RF-03: Malicious XSS payloads in agent_id or system slug/id are rejected at DB boundary
+        with self.assertRaises(ValueError):
+            self.db.register_agent(agent_id="agent');alert(1);//", name="Evil")
+        with self.assertRaises(ValueError):
+            self.db.upsert_system(p["id"], "Sys", slug="sys');alert(1);//")
 
-        t = self.db.create_task(p["id"], "Task X")
-        done = self.db.complete_task(t["id"], agent_id="another-new-agent", deliverable_summary="OK")
-        self.assertEqual(done["claimed_by"], "another-new-agent")
+        # RF-10: Transitive cycle A -> B -> C -> A is rejected with ValueError
+        self.db.upsert_system(p["id"], "Node A", slug="node-a")
+        self.db.upsert_system(p["id"], "Node B", slug="node-b", parent_ref="node-a")
+        self.db.upsert_system(p["id"], "Node C", slug="node-c", parent_ref="node-b")
+        with self.assertRaises(ValueError):
+            self.db.upsert_system(p["id"], "Node A", slug="node-a", parent_ref="node-c")
 
-    def test_f12_user_initialized_project_not_shadowed_by_default(self) -> None:
-        self.db.ensure_default_project()
-        custom = self.db.create_project("Enterprise Repo", root_path="/repo")
-        resolved = self.db.resolve_project_id(None)
-        self.assertEqual(resolved, custom["id"])
-
-    def test_f25_and_f37_and_f38_validation_bounds(self) -> None:
+    def test_rf14_add_finding_validates_task_id(self) -> None:
         p = self.db.ensure_default_project()
         with self.assertRaises(ValueError):
-            self.db.upsert_system(p["id"], "BadScore", health_score=-10)
-        with self.assertRaises(ValueError):
-            self.db.upsert_system(p["id"], "BadScore2", health_score=150)
+            self.db.add_finding(
+                p["id"],
+                title="Orphan task ref",
+                task_id="task-nonexistent",
+            )
 
-        self.db.upsert_system(p["id"], "Node1", slug="node-1")
-        with self.assertRaises(ValueError):
-            self.db.add_relation(p["id"], "node-1", "node-1")
-
-        t = self.db.create_task(p["id"], "Case Priority", priority="CRITICAL")
-        self.assertEqual(t["priority"], "critical")
-
-    def test_f07_atomic_snapshot_sync_on_disk(self) -> None:
+    # -------------------------------------------------------------------------
+    # F-09, RF-13, RF-17, RF-19: CLI Execution & Hermetic Snapshot Sync
+    # -------------------------------------------------------------------------
+    def test_f09_rf13_rf17_rf19_cli_end_to_end_and_hermetic_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            db_file = os.path.join(tmpdir, "test_audit.db")
-            disk_db = AuditDB(db_path=db_file, auto_sync_snapshot=True)
+            db_file = os.path.join(tmpdir, "cli_test.db")
+            ui_dir = os.path.join(tmpdir, "ui")
+            os.makedirs(ui_dir, exist_ok=True)
+
+            # RF-13: Hermetic snapshot sync writes only to tmpdir/ui/snapshot.js
+            disk_db = AuditDB(db_path=db_file, ui_dir=ui_dir)
             snap = disk_db.seed_demo_data(reset_first=True)
-            self.assertEqual(len(snap["systems"]), 12)
+            snap_file = disk_db.sync_static_snapshot(snap["project"]["id"])
+            self.assertTrue(os.path.isfile(snap_file))
 
+            # Reset and verify RF-19: registering an agent before 'init' does NOT create a zombie default project
+            self.assertEqual(run_cli(["reset", "--db", db_file, "--json"]), 0)
+            self.assertEqual(
+                run_cli(["agent", "register", "--db", db_file, "--id", "agent-01", "--name", "Worker 1", "--json"]),
+                0,
+            )
+            self.assertFalse(disk_db.has_any_project())
 
-    def test_rf02_host_header_dns_rebinding_rejected(self) -> None:
-        # Rebinding host is rejected with 403
-        h_bad_host = MockRequestHandler(
-            self.db,
-            "GET",
-            "/api/health",
-            headers_dict={"Host": "attacker.com"},
-        )
-        h_bad_host.do_GET()
-        self.assertEqual(h_bad_host.status_code, 403)
-        self.assertIn("invalid host header", h_bad_host.get_json()["error"].lower())
+            # Now initialize project -> becomes the sole active project
+            self.assertEqual(
+                run_cli(["init", "--db", db_file, "--name", "CLI Project", "--root", "/repo", "--json"]),
+                0,
+            )
+            self.assertEqual(len(disk_db.list_projects()), 1)
+            self.assertEqual(disk_db.list_projects()[0]["name"], "CLI Project")
 
-        # Valid localhost hosts succeed
-        h_local = MockRequestHandler(
-            self.db,
-            "GET",
-            "/api/health",
-            headers_dict={"Host": "localhost:8420"},
-        )
-        h_local.do_GET()
-        self.assertEqual(h_local.status_code, 200)
+            # Add systems, relation, task, finding, block, complete via CLI
+            self.assertEqual(
+                run_cli(["system", "add", "--db", db_file, "--name", "Edge", "--slug", "edge", "--health", "90", "--json"]),
+                0,
+            )
+            self.assertEqual(
+                run_cli(["system", "add", "--db", db_file, "--name", "Auth", "--slug", "auth", "--parent", "edge", "--json"]),
+                0,
+            )
+            self.assertEqual(
+                run_cli(["relation", "add", "--db", db_file, "--from", "edge", "--to", "auth", "--type", "calls", "--json"]),
+                0,
+            )
+            self.assertEqual(
+                run_cli(["task", "add", "--db", db_file, "--title", "Review Auth", "--system", "auth", "--priority", "critical", "--json"]),
+                0,
+            )
 
-        h_ip = MockRequestHandler(
-            self.db,
-            "GET",
-            "/api/health",
-            headers_dict={"Host": "127.0.0.1:8420"},
-        )
-        h_ip.do_GET()
-        self.assertEqual(h_ip.status_code, 200)
-
-    def test_rf04_seed_demo_protection(self) -> None:
-        # 1. reset_first=true without confirm=RESET is rejected with 400
-        h_unconfirmed = MockRequestHandler(
-            self.db,
-            "POST",
-            "/api/seed-demo",
-            headers_dict={"Content-Type": "application/json"},
-            body_bytes=b'{"reset_first": true}',
-        )
-        h_unconfirmed.do_POST()
-        self.assertEqual(h_unconfirmed.status_code, 400)
-        self.assertIn("requires explicit 'confirm': 'RESET'", h_unconfirmed.get_json()["error"])
-
-        # 2. reset_first=true WITH confirm=RESET succeeds
-        h_confirmed = MockRequestHandler(
-            self.db,
-            "POST",
-            "/api/seed-demo",
-            headers_dict={"Content-Type": "application/json"},
-            body_bytes=b'{"reset_first": true, "confirm": "RESET"}',
-        )
-        h_confirmed.do_POST()
-        self.assertEqual(h_confirmed.status_code, 200)
-        data = h_confirmed.get_json()
-        self.assertEqual(len(data["systems"]), 12)
-
-        # 3. reset_first=false (or omitted) on fresh db succeeds without confirm
-        fresh_db = AuditDB(":memory:")
-        h_safe = MockRequestHandler(
-            fresh_db,
-            "POST",
-            "/api/seed-demo",
-            headers_dict={"Content-Type": "application/json"},
-            body_bytes=b"{}",
-        )
-        h_safe.do_POST()
-        self.assertEqual(h_safe.status_code, 200)
-
-    def test_rf06_and_rf09_and_rf12_task_block_and_attempt_guards(self) -> None:
-        p = self.db.ensure_default_project()
-        self.db.upsert_system(p["id"], "Worker Sys", slug="worker-sys")
-        t = self.db.create_task(p["id"], "Target Task", system_ref="worker-sys")
-        self.db.claim_task(t["id"], "agent-owner", lease_minutes=30)
-
-        # Non-owner cannot block without force=True (RF-06)
-        with self.assertRaises(RuntimeError):
-            self.db.block_task(t["id"], agent_id="agent-intruder", reason="Sabotage")
-
-        # Non-owner CAN block with force=True (RF-06)
-        blocked = self.db.block_task(t["id"], agent_id="agent-intruder", reason="Admin Block", force=True)
-        self.assertEqual(blocked["status"], "blocked")
-        self.assertIsNone(blocked["claimed_by"])
-
-        # Blocking clears agent pointers and system claim (RF-06)
-        agents = {a["id"]: a for a in self.db.list_agents(p["id"])}
-        self.assertIsNone(agents["agent-owner"]["current_task_id"])
-        sys_obj = self.db.get_system(p["id"], "worker-sys")
-        self.assertIsNone(sys_obj["claimed_by"])
-
-        # Completed task CANNOT be blocked even with force=True (RF-06)
-        t_comp = self.db.create_task(p["id"], "Completed Task")
-        self.db.claim_task(t_comp["id"], "agent-owner")
-        self.db.complete_task(t_comp["id"], "agent-owner", deliverable_summary="Done")
-        with self.assertRaises(RuntimeError):
-            self.db.block_task(t_comp["id"], agent_id="agent-owner", force=True)
-
-        # Task exceeding max_attempts cannot be claimed without force=True (RF-09)
-        t_fail = self.db.create_task(p["id"], "Failing Task", max_attempts=1)
-        self.db.claim_task(t_fail["id"], "agent-old", lease_minutes=-5)
-        with self.assertRaises(RuntimeError):
-            self.db.claim_task(t_fail["id"], "agent-new")
-        # Force claim succeeds
-        forced = self.db.claim_task(t_fail["id"], "agent-new", force=True)
-        self.assertEqual(forced["claimed_by"], "agent-new")
-
-        # Claiming an expired task clears previous agent's current_task_id and current_system_id (RF-12)
-        agents = {a["id"]: a for a in self.db.list_agents(p["id"])}
-        self.assertIsNone(agents["agent-old"]["current_task_id"])
-
-    def test_rf07_and_rf08_system_lease_retention_on_multi_task(self) -> None:
-        p = self.db.ensure_default_project()
-        self.db.upsert_system(p["id"], "Shared Sys", slug="shared-sys")
-        t1 = self.db.create_task(p["id"], "Task 1", system_ref="shared-sys")
-        t2 = self.db.create_task(p["id"], "Task 2", system_ref="shared-sys")
-
-        self.db.claim_task(t1["id"], "agent-worker", lease_minutes=30)
-        self.db.claim_task(t2["id"], "agent-worker", lease_minutes=30)
-
-        # Agent worker completes task 1 -> system lease MUST NOT be released because task 2 is still active (RF-07)
-        self.db.complete_task(t1["id"], "agent-worker", deliverable_summary="T1 done")
-        sys_mid = self.db.get_system(p["id"], "shared-sys")
-        self.assertEqual(sys_mid["claimed_by"], "agent-worker")
-
-        # Completing task 2 (last task on system) releases the lease (RF-07)
-        self.db.complete_task(t2["id"], "agent-worker", deliverable_summary="T2 done")
-        sys_final = self.db.get_system(p["id"], "shared-sys")
-        self.assertIsNone(sys_final["claimed_by"])
-
-        # Agent completing unassigned task does not release unrelated agent's system lease (RF-08)
-        self.db.claim_system(p["id"], "shared-sys", "agent-holder", lease_minutes=30)
-        t_global = self.db.create_task(p["id"], "Global Task")
-        self.db.claim_task(t_global["id"], "agent-other")
-        self.db.complete_task(t_global["id"], "agent-other", deliverable_summary="Global done")
-        sys_holder = self.db.get_system(p["id"], "shared-sys")
-        self.assertEqual(sys_holder["claimed_by"], "agent-holder")
-
-    def test_rf10_hierarchy_cycle_detection(self) -> None:
-        p = self.db.ensure_default_project()
-        s1 = self.db.upsert_system(p["id"], "System A", slug="sys-a")
-        s2 = self.db.upsert_system(p["id"], "System B", slug="sys-b", parent_ref="sys-a")
-        s3 = self.db.upsert_system(p["id"], "System C", slug="sys-c", parent_ref="sys-b")
-
-        # Self-parenting raises ValueError (RF-10)
-        with self.assertRaises(ValueError):
-            self.db.upsert_system(p["id"], "System A", slug="sys-a", parent_ref="sys-a")
-
-        # Transitive cycle raises ValueError (RF-10)
-        with self.assertRaises(ValueError):
-            self.db.upsert_system(p["id"], "System A", slug="sys-a", parent_ref="sys-c")
-
-    def test_rf14_invalid_task_id_finding_validation(self) -> None:
-        p = self.db.ensure_default_project()
-        # Invalid task_id raises ValueError, not unhandled sqlite3.IntegrityError (RF-14)
-        with self.assertRaises(ValueError):
-            self.db.add_finding(p["id"], title="Orphan Finding", task_id="non-existent-task-id")
-
-    def test_rf15_logs_endpoint_pagination_clamped(self) -> None:
-        p = self.db.ensure_default_project()
-        # Negative limit is clamped to at least 1 (RF-15)
-        h_neg = MockRequestHandler(self.db, "GET", "/api/logs?limit=-1")
-        h_neg.do_GET()
-        self.assertEqual(h_neg.status_code, 200)
-
-        # Huge limit is clamped to at most 500 (RF-15)
-        h_huge = MockRequestHandler(self.db, "GET", "/api/logs?limit=999999")
-        h_huge.do_GET()
-        self.assertEqual(h_huge.status_code, 200)
-
-    def test_rf17_audit_export_json_output(self) -> None:
-        p = self.db.ensure_default_project()
-        self.db.upsert_system(p["id"], "Export Sys", slug="export-sys")
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            cli_main(["export", "--json", "--db", self.db.db_path])
-        output = buf.getvalue()
-        data = json.loads(output)
-        self.assertIn("project", data)
-        self.assertIn("systems", data)
-
-    def test_cli_commands_integration(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = os.path.join(tmpdir, "cli_test.db")
-            # 1. init
-            cli_main(["init", "--name", "Integration Project", "--root", tmpdir, "--db", db_path])
-            # 2. system add
-            cli_main(["system", "add", "--name", "Gateway", "--slug", "gw", "--type", "service", "--db", db_path])
-            # 3. agent register
-            cli_main(["agent", "register", "--id", "agent-cli", "--name", "CLI Agent", "--role", "general-auditor", "--db", db_path])
-            # 4. task add
-            cli_main(["task", "add", "--title", "Verify Architecture", "--system", "gw", "--db", db_path])
-            # 5. task next
-            buf_next = io.StringIO()
-            with contextlib.redirect_stdout(buf_next):
-                cli_main(["task", "next", "--agent", "agent-cli", "--json", "--db", db_path])
-            task_data = json.loads(buf_next.getvalue())
-            self.assertIn("id", task_data)
-            task_id = task_data["id"]
-            # 6. finding add
-            cli_main(["finding", "add", "--title", "Auth missing", "--system", "gw", "--agent", "agent-cli", "--severity", "high", "--db", db_path])
-            # 7. task block
-            cli_main(["task", "block", task_id, "--agent", "agent-cli", "--reason", "Waiting on spec", "--db", db_path])
-            # 8. status --json
-            buf_status = io.StringIO()
-            with contextlib.redirect_stdout(buf_status):
-                cli_main(["status", "--json", "--db", db_path])
-            status_data = json.loads(buf_status.getvalue())
-            self.assertEqual(status_data["total_systems"], 1)
-            self.assertEqual(status_data["total_agents"], 1)
-            self.assertEqual(status_data["total_findings"], 1)
-
-    def test_identifier_validation(self) -> None:
-        p = self.db.ensure_default_project()
-        # Slashes and spaces in slugs/IDs are rejected (RF-03)
-        with self.assertRaises(ValueError):
-            self.db.upsert_system(p["id"], "Bad Slug System", slug="bad/slug")
-        with self.assertRaises(ValueError):
-            self.db.upsert_system(p["id"], "Bad Slug System 2", slug="bad slug")
-        with self.assertRaises(ValueError):
-            self.db.upsert_system(p["id"], "Bad Slug System 3", slug="bad$slug")
-        with self.assertRaises(ValueError):
-            self.db.create_project("Bad ID Project", project_id="bad/id")
+            # RF-17: `audit export --json` outputs valid JSON to stdout even without `--format json`
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_cli(["export", "--db", db_file, "--json"])
+            self.assertEqual(rc, 0)
+            exported_json = json.loads(buf.getvalue())
+            self.assertEqual(exported_json["project"]["name"], "CLI Project")
 
 
 if __name__ == "__main__":

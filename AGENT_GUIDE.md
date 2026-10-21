@@ -6,7 +6,7 @@
 
 ## 1. Core Principles
 
-1. **Always Identify Yourself**: Pick a unique, descriptive Agent ID (e.g., `agent-arch-01`, `agent-sec-02`, `agent-perf-03`) and register it before claiming work. Either export `AUDIT_AGENT_ID=<your-id>` or pass `--agent <your-id>` on every CLI call (flags like `--agent`, `--json`, `--project`, and `--db` work either before or after subcommands).
+1. **Always Identify Yourself**: Pick a unique, descriptive alphanumeric Agent ID (e.g., `agent-arch-01`, `agent-sec-02`, `agent-perf-03`) and register it before claiming work. Either export `AUDIT_AGENT_ID=<your-id>` or pass `--agent <your-id>` on every CLI call (flags like `--agent`, `--json`, `--project`, and `--db` work either before or after subcommands).
 2. **Use `--json` for Programmatic Parsing**: Every `./audit` command supports `--json` so agents can parse exact IDs, slugs, timestamps, and lease locks.
 3. **Claim Before Auditing**: Always claim a task (`./audit task next --agent <id>`) or claim a system/subsystem (`./audit system claim <slug> --agent <id>`) before performing deep review so parallel agents know you own that scope.
 4. **Model Hierarchy & Cross-System Interactions**:
@@ -18,17 +18,18 @@
 
 ## 2. Step-by-Step Agent Workflow
 
-### Step 1: Check Project Status or Initialize Target Project
-```bash
-./audit status
-./audit system tree
-```
-If the project has not been initialized yet:
+### Step 1: Initialize or Check Project Status
+If starting a fresh audit on a repository, initialize the project first:
 ```bash
 ./audit init \
   --name "My Target Codebase" \
-  --root "." \
+  --root "/absolute/path/to/codebase" \
   --desc "Full architecture and subsystem review"
+```
+To inspect existing project status and hierarchy:
+```bash
+./audit status
+./audit system tree
 ```
 
 ### Step 2: Register Your Agent Identity

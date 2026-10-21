@@ -22,11 +22,27 @@ def future_utc_iso(minutes: int = 30) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+VALID_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def validate_identifier(value: Optional[str], field_name: str = "id") -> Optional[str]:
+    """Validate that an identifier or slug contains only safe alphanumeric, underscore, or hyphen characters (RF-03)."""
+    if value is None or value == "":
+        return None
+    val = str(value).strip()
+    if not VALID_ID_RE.match(val):
+        raise ValueError(
+            f"Invalid {field_name} '{val}': must be 1-64 characters matching [a-zA-Z0-9_-]."
+        )
+    return val
+
+
 def slugify(value: str) -> str:
     """Create a URL/CLI-friendly slug from a name."""
     s = re.sub(r"[^a-zA-Z0-9\s_-]", "", value.strip().lower())
     s = re.sub(r"[\s_]+", "-", s)
-    return s.strip("-") or f"item-{uuid.uuid4().hex[:8]}"
+    cleaned = s.strip("-")[:64].strip("-")
+    return cleaned or f"item-{uuid.uuid4().hex[:8]}"
 
 
 def short_id(prefix: str) -> str:
@@ -48,14 +64,6 @@ VALID_PRIORITIES = ("critical", "high", "medium", "low")
 VALID_SEVERITIES = ("critical", "high", "medium", "low", "info")
 VALID_SYSTEM_STATUSES = ("unreviewed", "in_progress", "reviewed", "needs_attention", "healthy")
 VALID_TASK_STATUSES = ("open", "claimed", "completed", "blocked")
-
-
-def validate_identifier(val: str, field_name: str = "identifier") -> str:
-    """Validate that an entity identifier or slug contains only safe alphanumeric/dash/underscore chars (RF-03)."""
-    cleaned = (val or "").strip()
-    if not cleaned or not re.match(r"^[a-zA-Z0-9_.-]+$", cleaned):
-        raise ValueError(f"Invalid {field_name} '{val}'. Must match ^[a-zA-Z0-9_.-]+$ and cannot be empty.")
-    return cleaned
 
 
 SCHEMA_SQL = """
@@ -239,10 +247,12 @@ class AuditDB:
     def __init__(
         self,
         db_path: Optional[str] = None,
-        auto_sync_snapshot: bool = True,
+        auto_sync_snapshot: bool = False,
         ui_dir: Optional[str] = None,
     ) -> None:
-        self.ui_dir = os.path.abspath(ui_dir) if ui_dir else os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
+        self.ui_dir = os.path.abspath(
+            ui_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
+        )
         if db_path == ":memory:":
             self.db_path = ":memory:"
             self._shared_mem_uri = f"file:auditos_{uuid.uuid4().hex}?mode=memory&cache=shared"
@@ -288,6 +298,8 @@ class AuditDB:
             raise
         finally:
             conn.close()
+        if immediate and self.auto_sync_snapshot:
+            self.sync_static_snapshot()
 
     def init_db(self) -> None:
         """Initialize schema only when tables are missing to avoid exclusive DDL locks on reads (F-26)."""
@@ -301,7 +313,6 @@ class AuditDB:
                 conn.executescript(SCHEMA_SQL)
                 conn.commit()
             else:
-                # Ensure lightweight forward-compatible columns exist if upgrading an older DB
                 agent_cols = {r[1] for r in conn.execute("PRAGMA table_info(agents)").fetchall()}
                 if "project_id" not in agent_cols:
                     conn.execute("ALTER TABLE agents ADD COLUMN project_id TEXT DEFAULT NULL;")
@@ -315,56 +326,54 @@ class AuditDB:
         finally:
             conn.close()
 
-    def sync_static_snapshot(self, project_ref: Optional[str] = None) -> None:
-        """Atomically write ui/snapshot.js via temp file + os.replace to prevent 0-byte truncation races (F-07, RF-13)."""
+    def sync_static_snapshot(self, project_ref: Optional[str] = None) -> Optional[str]:
+        """Atomically write snapshot.js via temp file + os.replace to prevent 0-byte truncation races (F-07, RF-13)."""
         if self.db_path == ":memory:":
-            return
+            return None
+        if not os.path.isdir(self.ui_dir):
+            return None
+        snap = self.get_project_snapshot(project_ref)
+        snap_path = os.path.join(self.ui_dir, "snapshot.js")
+        fd, tmp_path = tempfile.mkstemp(prefix=".snapshot_", suffix=".tmp", dir=self.ui_dir)
         try:
-            ui_dir = self.ui_dir
-            if not os.path.isdir(ui_dir):
-                return
-            snap = self.get_project_snapshot(project_ref)
-            snap_path = os.path.join(ui_dir, "snapshot.js")
-            fd, tmp_path = tempfile.mkstemp(prefix=".snapshot_", suffix=".tmp", dir=ui_dir)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write("window.__AUDIT_SNAPSHOT__ = ")
-                    json.dump(snap, f, indent=2)
-                    f.write(";\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_path, snap_path)
-            except Exception:
-                if os.path.exists(tmp_path):
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("window.__AUDIT_SNAPSHOT__ = ")
+                json.dump(snap, f, indent=2)
+                f.write(";\n")
+                f.flush()
+            os.replace(tmp_path, snap_path)
+            return snap_path
         except Exception:
-            pass
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
 
     def _ensure_agent_in_conn(
         self,
         conn: sqlite3.Connection,
         agent_id: Optional[str],
         project_id: Optional[str] = None,
-    ) -> None:
-        """Ensure an agent ID exists in agents table before foreign-key writes (F-10, RF-03)."""
+    ) -> Optional[str]:
+        """Validate and ensure an agent ID exists in agents table before foreign-key writes (F-10, RF-03)."""
         if not agent_id:
-            return
-        agent_id = validate_identifier(agent_id, "agent_id")
+            return None
+        aid = validate_identifier(agent_id, "agent_id")
         now = utc_now_iso()
-        agent = conn.execute("SELECT id, project_id FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        agent = conn.execute("SELECT id, project_id FROM agents WHERE id = ?", (aid,)).fetchone()
         if not agent:
             conn.execute(
                 """
                 INSERT INTO agents (id, project_id, name, role, status, registered_at, last_heartbeat, metadata_json)
                 VALUES (?, ?, ?, 'general-auditor', 'active', ?, ?, '{}')
                 """,
-                (agent_id, project_id, agent_id, now, now),
+                (aid, project_id, aid, now, now),
             )
         elif project_id and not agent["project_id"]:
-            conn.execute("UPDATE agents SET project_id = ? WHERE id = ?", (project_id, agent_id))
+            conn.execute("UPDATE agents SET project_id = ? WHERE id = ?", (project_id, aid))
+        return aid
 
     def _log_event(
         self,
@@ -379,11 +388,11 @@ class AuditDB:
     ) -> str:
         log_id = short_id("log")
         now = utc_now_iso()
-        if agent_id:
-            self._ensure_agent_in_conn(conn, agent_id, project_id)
+        aid = self._ensure_agent_in_conn(conn, agent_id, project_id) if agent_id else None
+        if aid:
             conn.execute(
                 "UPDATE agents SET last_heartbeat = ?, status = CASE WHEN status = 'offline' THEN 'offline' ELSE 'active' END WHERE id = ?",
-                (now, agent_id),
+                (now, aid),
             )
         conn.execute(
             """
@@ -393,7 +402,7 @@ class AuditDB:
             (
                 log_id,
                 project_id,
-                agent_id,
+                aid,
                 action,
                 entity_type,
                 entity_id,
@@ -414,7 +423,7 @@ class AuditDB:
         description: str = "Multi-agent system and subsystem codebase review",
         conn: Optional[sqlite3.Connection] = None,
     ) -> Dict[str, Any]:
-        def _exec(c: sqlite3.Connection) -> Dict[str, Any]:
+        def _impl(c: sqlite3.Connection) -> Dict[str, Any]:
             row = c.execute(
                 """
                 SELECT * FROM projects
@@ -448,9 +457,9 @@ class AuditDB:
             return dict(c.execute("SELECT * FROM projects WHERE id = ?", (proj_id,)).fetchone())
 
         if conn is not None:
-            return _exec(conn)
+            return _impl(conn)
         with self.connect(immediate=True) as c:
-            return _exec(c)
+            return _impl(c)
 
     def create_project(
         self,
@@ -461,17 +470,14 @@ class AuditDB:
         project_id: Optional[str] = None,
         agent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if not name or not str(name).strip():
+            raise ValueError("Project name is required.")
+        pid = validate_identifier(project_id, "project_id") if project_id else short_id("proj")
         with self.connect(immediate=True) as conn:
-            if project_id:
-                pid = validate_identifier(project_id.strip(), "project_id")
-            else:
-                pid = short_id("proj")
             base_slug = slugify(name)
             slug = base_slug
             existing = conn.execute("SELECT id FROM projects WHERE slug = ? OR id = ?", (slug, pid)).fetchone()
             if existing:
-                if existing["id"] == pid:
-                    pid = f"{pid}-{uuid.uuid4().hex[:6]}"
                 slug = f"{base_slug}-{uuid.uuid4().hex[:6]}"
             now = utc_now_iso()
             conn.execute(
@@ -479,7 +485,7 @@ class AuditDB:
                 INSERT INTO projects (id, slug, name, root_path, description, details, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (pid, slug, name, root_path, description, details, now, now),
+                (pid, slug, name.strip(), root_path, description, details, now, now),
             )
             self._log_event(
                 conn,
@@ -488,7 +494,7 @@ class AuditDB:
                 "project.created",
                 "project",
                 pid,
-                f"Created project '{name}'",
+                f"Created project '{name.strip()}'",
                 {"root_path": root_path},
             )
             return dict(conn.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone())
@@ -501,10 +507,15 @@ class AuditDB:
             rows = c.execute("SELECT * FROM projects ORDER BY updated_at DESC").fetchall()
             return [dict(r) for r in rows]
 
+    def has_any_project(self) -> bool:
+        with self.connect() as conn:
+            row = conn.execute("SELECT id FROM projects LIMIT 1").fetchone()
+            return row is not None
+
     def resolve_project_id(
         self, project_ref: Optional[str] = None, conn: Optional[sqlite3.Connection] = None
     ) -> str:
-        """Resolve explicit project ref or select the most recently created/updated non-default project (F-12)."""
+        """Resolve explicit project ref or select the most recently created/updated non-default project (F-12, RF-18)."""
         def _lookup(c: sqlite3.Connection) -> Optional[str]:
             if project_ref:
                 row = c.execute(
@@ -530,13 +541,13 @@ class AuditDB:
                 return found
             proj = self.ensure_default_project(conn=conn)
             return proj["id"]
-        else:
-            with self.connect() as c:
-                found = _lookup(c)
-                if found:
-                    return found
-            proj = self.ensure_default_project()
-            return proj["id"]
+
+        with self.connect() as c:
+            found = _lookup(c)
+            if found:
+                return found
+        proj = self.ensure_default_project()
+        return proj["id"]
 
     # -------------------------------------------------------------------------
     # Agents (Workers)
@@ -551,8 +562,7 @@ class AuditDB:
         status: str = "active",
         project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        raw_id = agent_id.strip() if agent_id else short_id("agent")
-        aid = validate_identifier(raw_id, "agent_id")
+        aid = validate_identifier(agent_id, "agent_id") if agent_id else short_id("agent")
         display_name = name.strip() if name else aid
         now = utc_now_iso()
         with self.connect(immediate=True) as conn:
@@ -591,68 +601,80 @@ class AuditDB:
         status: str = "active",
         extend_leases_minutes: int = 30,
     ) -> Dict[str, Any]:
-        """Update agent heartbeat; only extend unexpired leases and release locks if offline (F-23)."""
+        """Update agent heartbeat; only extend unexpired leases and cleanly release/block when offline (F-23, RF-09, RF-16)."""
+        aid = validate_identifier(agent_id, "agent_id")
         now = utc_now_iso()
         new_lease = future_utc_iso(extend_leases_minutes)
         norm_status = (status or "active").strip().lower()
         with self.connect(immediate=True) as conn:
-            row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+            row = conn.execute("SELECT * FROM agents WHERE id = ?", (aid,)).fetchone()
             if not row:
-                raise ValueError(f"Agent '{agent_id}' is not registered. Run 'agent register' first.")
+                raise ValueError(f"Agent '{aid}' is not registered. Run 'agent register' first.")
 
             if norm_status == "offline":
-                claimed_sys_rows = conn.execute(
-                    "SELECT id, status FROM systems WHERE claimed_by = ?", (agent_id,)
-                ).fetchall()
-                conn.execute(
-                    """
-                    UPDATE systems
-                    SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ?
-                    WHERE claimed_by = ?
-                    """,
-                    (now, agent_id),
-                )
+                # Release or block tasks held by this offline agent (RF-09)
                 conn.execute(
                     """
                     UPDATE tasks
                     SET status = CASE WHEN attempt_count >= max_attempts THEN 'blocked' ELSE 'open' END,
-                        blocked_reason = CASE WHEN attempt_count >= max_attempts THEN 'Exceeded max_attempts (' || max_attempts || ')' ELSE blocked_reason END,
+                        blocked_reason = CASE
+                            WHEN attempt_count >= max_attempts
+                            THEN 'Agent went offline after reaching max_attempts (' || max_attempts || ')'
+                            ELSE blocked_reason END,
                         claimed_by = NULL,
                         claimed_at = NULL,
                         lease_until = NULL,
                         updated_at = ?
                     WHERE claimed_by = ? AND status = 'claimed'
                     """,
-                    (now, agent_id),
+                    (now, aid),
                 )
-                for s_row in claimed_sys_rows:
-                    sid = s_row["id"]
-                    active_tasks = conn.execute(
+                # Release systems held by this offline agent and reset orphaned 'in_progress' status (RF-16)
+                claimed_systems = conn.execute(
+                    "SELECT id, status FROM systems WHERE claimed_by = ?", (aid,)
+                ).fetchall()
+                for srow in claimed_systems:
+                    sid = srow["id"]
+                    open_crit_high = conn.execute(
+                        """
+                        SELECT COUNT(*) AS cnt FROM findings
+                        WHERE system_id = ? AND severity IN ('critical', 'high') AND status NOT IN ('resolved', 'wont_fix')
+                        """,
+                        (sid,),
+                    ).fetchone()["cnt"]
+                    other_claimed_tasks = conn.execute(
                         "SELECT COUNT(*) AS cnt FROM tasks WHERE system_id = ? AND status = 'claimed'",
                         (sid,),
                     ).fetchone()["cnt"]
-                    if active_tasks == 0 and s_row["status"] == "in_progress":
-                        open_crit_high = conn.execute(
-                            """
-                            SELECT COUNT(*) AS cnt FROM findings
-                            WHERE system_id = ? AND severity IN ('critical', 'high') AND status NOT IN ('resolved', 'wont_fix')
-                            """,
-                            (sid,),
-                        ).fetchone()["cnt"]
-                        reset_status = "needs_attention" if open_crit_high > 0 else "unreviewed"
-                        conn.execute("UPDATE systems SET status = ?, updated_at = ? WHERE id = ?", (reset_status, now, sid))
+                    if open_crit_high > 0:
+                        next_sys_status = "needs_attention"
+                    elif other_claimed_tasks > 0:
+                        next_sys_status = "in_progress"
+                    elif srow["status"] == "in_progress":
+                        next_sys_status = "unreviewed"
+                    else:
+                        next_sys_status = srow["status"]
+                    conn.execute(
+                        """
+                        UPDATE systems
+                        SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL,
+                            status = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (next_sys_status, now, sid),
+                    )
                 conn.execute(
                     """
                     UPDATE agents
                     SET last_heartbeat = ?, status = 'offline', current_task_id = NULL, current_system_id = NULL
                     WHERE id = ?
                     """,
-                    (now, agent_id),
+                    (now, aid),
                 )
             else:
                 conn.execute(
                     "UPDATE agents SET last_heartbeat = ?, status = ? WHERE id = ?",
-                    (now, norm_status, agent_id),
+                    (now, norm_status, aid),
                 )
                 conn.execute(
                     """
@@ -660,7 +682,7 @@ class AuditDB:
                     SET lease_until = ?, updated_at = ?
                     WHERE claimed_by = ? AND (lease_until IS NULL OR lease_until >= ?)
                     """,
-                    (new_lease, now, agent_id, now),
+                    (new_lease, now, aid, now),
                 )
                 conn.execute(
                     """
@@ -668,9 +690,9 @@ class AuditDB:
                     SET lease_until = ?, updated_at = ?
                     WHERE claimed_by = ? AND status = 'claimed' AND (lease_until IS NULL OR lease_until >= ?)
                     """,
-                    (new_lease, now, agent_id, now),
+                    (new_lease, now, aid, now),
                 )
-            return dict(conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone())
+            return dict(conn.execute("SELECT * FROM agents WHERE id = ?", (aid,)).fetchone())
 
     def list_agents(
         self,
@@ -760,6 +782,39 @@ class AuditDB:
                 raise ValueError(f"System or subsystem '{system_ref}' not found in project '{project_id}'.")
             return sys_obj["id"]
 
+    def _compute_post_audit_system_status(
+        self,
+        conn: sqlite3.Connection,
+        system_id: str,
+        current_status: str,
+        requested_status: Optional[str],
+    ) -> str:
+        """Prevent systems with open critical/high findings from being marked reviewed, healthy, or unreviewed (F-02, RF-01)."""
+        open_crit_high = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM findings
+            WHERE system_id = ?
+              AND severity IN ('critical', 'high')
+              AND status NOT IN ('resolved', 'wont_fix')
+            """,
+            (system_id,),
+        ).fetchone()["cnt"]
+
+        if open_crit_high > 0 and requested_status in (None, "reviewed", "healthy", "unreviewed"):
+            return "needs_attention"
+        if requested_status:
+            return requested_status
+        active_tasks = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM tasks
+            WHERE system_id = ? AND status IN ('open', 'claimed')
+            """,
+            (system_id,),
+        ).fetchone()["cnt"]
+        if active_tasks > 0 and current_status == "in_progress":
+            return "in_progress"
+        return "reviewed" if current_status == "in_progress" else current_status
+
     def upsert_system(
         self,
         project_id: str,
@@ -775,10 +830,16 @@ class AuditDB:
         slug: Optional[str] = None,
         system_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if not name or not str(name).strip():
+            raise ValueError("System name is required.")
         validated_health = validate_health_score(health_score)
+        if system_id:
+            system_id = validate_identifier(system_id, "system_id")
+        if slug:
+            slug = validate_identifier(slug, "slug")
         now = utc_now_iso()
         with self.connect(immediate=True) as conn:
-            self._ensure_agent_in_conn(conn, agent_id, project_id)
+            aid = self._ensure_agent_in_conn(conn, agent_id, project_id)
             parent_id = None
             if parent_ref:
                 parent_obj = self._resolve_system_in_conn(conn, project_id, parent_ref)
@@ -786,14 +847,10 @@ class AuditDB:
                     raise ValueError(f"Parent system '{parent_ref}' not found.")
                 parent_id = parent_obj["id"]
 
-            if slug:
-                target_slug = validate_identifier(slug.strip(), "slug")
-            else:
-                target_slug = validate_identifier(slugify(name), "slug")
+            target_slug = slug or slugify(name)
             existing = None
             if system_id:
-                clean_sys_id = validate_identifier(system_id.strip(), "system_id")
-                row = conn.execute("SELECT * FROM systems WHERE id = ? AND project_id = ?", (clean_sys_id, project_id)).fetchone()
+                row = conn.execute("SELECT * FROM systems WHERE id = ? AND project_id = ?", (system_id, project_id)).fetchone()
                 existing = dict(row) if row else None
             if not existing:
                 row = conn.execute(
@@ -805,31 +862,29 @@ class AuditDB:
             if existing:
                 sid = existing["id"]
                 new_parent = parent_id if parent_ref is not None else existing["parent_id"]
-                if new_parent:
-                    if new_parent == sid:
-                        raise ValueError("A system cannot be its own parent.")
-                    curr = new_parent
-                    visited_ancestors = {sid}
-                    while curr:
-                        p_row = conn.execute("SELECT parent_id FROM systems WHERE id = ? AND project_id = ?", (curr, project_id)).fetchone()
-                        if not p_row:
-                            break
-                        curr = p_row["parent_id"]
-                        if curr in visited_ancestors:
-                            raise ValueError("Hierarchy cycle detected: system cannot be an ancestor of itself.")
-                        if curr:
-                            visited_ancestors.add(curr)
+                # Walk full ancestor chain to reject both direct and transitive hierarchy cycles (RF-10)
+                curr_anc = new_parent
+                visited_anc = {sid}
+                while curr_anc:
+                    if curr_anc in visited_anc:
+                        raise ValueError(
+                            "Hierarchy cycle detected: a system cannot be a direct or transitive parent of itself."
+                        )
+                    visited_anc.add(curr_anc)
+                    prow = conn.execute("SELECT parent_id FROM systems WHERE id = ?", (curr_anc,)).fetchone()
+                    curr_anc = prow["parent_id"] if prow else None
+
                 new_type = system_type or existing["system_type"]
                 new_path = path_scope if path_scope is not None else existing["path_scope"]
                 new_desc = description if description is not None else existing["description"]
                 new_details = details if details is not None else existing["details"]
-                if status:
-                    new_status = self._compute_post_audit_system_status(conn, sid, existing["status"], status)
-                else:
-                    new_status = existing["status"]
+                # Enforce _compute_post_audit_system_status so upsert_system cannot mask open critical/high findings (RF-01)
+                new_status = self._compute_post_audit_system_status(
+                    conn, sid, existing["status"], status
+                )
                 new_health = validated_health if validated_health is not None else existing["health_score"]
-                last_by = agent_id or existing["last_audited_by"]
-                last_at = now if agent_id else existing["last_audited_at"]
+                last_by = aid or existing["last_audited_by"]
+                last_at = now if aid else existing["last_audited_at"]
 
                 conn.execute(
                     """
@@ -840,7 +895,7 @@ class AuditDB:
                     WHERE id = ?
                     """,
                     (
-                        name or existing["name"],
+                        name.strip() or existing["name"],
                         new_parent,
                         new_type,
                         new_path,
@@ -857,11 +912,11 @@ class AuditDB:
                 self._log_event(
                     conn,
                     project_id,
-                    agent_id,
+                    aid,
                     "system.updated",
                     "system",
                     sid,
-                    f"Updated {new_type} '{name}' ({target_slug}) [status: {new_status}]",
+                    f"Updated {new_type} '{name.strip()}' ({target_slug}) [status: {new_status}]",
                     {"status": new_status, "health_score": new_health},
                 )
             else:
@@ -882,15 +937,15 @@ class AuditDB:
                         project_id,
                         parent_id,
                         target_slug,
-                        name,
+                        name.strip(),
                         inferred_type,
                         path_scope or "",
                         description or "",
                         details or "",
                         init_status,
                         validated_health,
-                        agent_id,
-                        now if agent_id else None,
+                        aid,
+                        now if aid else None,
                         now,
                         now,
                     ),
@@ -898,11 +953,11 @@ class AuditDB:
                 self._log_event(
                     conn,
                     project_id,
-                    agent_id,
+                    aid,
                     "system.created",
                     "system",
                     sid,
-                    f"Registered {inferred_type} '{name}' ({target_slug})",
+                    f"Registered {inferred_type} '{name.strip()}' ({target_slug})",
                     {"parent_id": parent_id, "path_scope": path_scope or ""},
                 )
 
@@ -920,7 +975,9 @@ class AuditDB:
         now = utc_now_iso()
         lease_until = future_utc_iso(lease_minutes)
         with self.connect(immediate=True) as conn:
-            self._ensure_agent_in_conn(conn, agent_id, project_id)
+            aid = self._ensure_agent_in_conn(conn, agent_id, project_id)
+            if not aid:
+                raise ValueError("agent_id is required to claim a system.")
             sys_obj = self._resolve_system_in_conn(conn, project_id, system_ref)
             if not sys_obj:
                 raise ValueError(f"System '{system_ref}' not found.")
@@ -929,7 +986,7 @@ class AuditDB:
             current_lease = sys_obj["lease_until"]
             if (
                 current_holder
-                and current_holder != agent_id
+                and current_holder != aid
                 and not force
                 and current_lease
                 and current_lease > now
@@ -938,11 +995,11 @@ class AuditDB:
                     f"System '{sys_obj['name']}' is currently claimed by agent '{current_holder}' until {current_lease}."
                 )
 
-            if current_holder and current_holder != agent_id:
-                conn.execute(
-                    "UPDATE agents SET current_system_id = NULL WHERE id = ? AND current_system_id = ?",
-                    (current_holder, sys_obj["id"]),
-                )
+            # Clear stale system pointers on any previous holder (RF-12)
+            conn.execute(
+                "UPDATE agents SET current_system_id = NULL WHERE current_system_id = ? AND id != ?",
+                (sys_obj["id"], aid),
+            )
 
             new_status = "in_progress" if sys_obj["status"] == "unreviewed" else sys_obj["status"]
             conn.execute(
@@ -951,58 +1008,23 @@ class AuditDB:
                 SET claimed_by = ?, claimed_at = ?, lease_until = ?, status = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (agent_id, now, lease_until, new_status, now, sys_obj["id"]),
+                (aid, now, lease_until, new_status, now, sys_obj["id"]),
             )
             conn.execute(
                 "UPDATE agents SET current_system_id = ?, last_heartbeat = ?, status = 'active' WHERE id = ?",
-                (sys_obj["id"], now, agent_id),
+                (sys_obj["id"], now, aid),
             )
             self._log_event(
                 conn,
                 project_id,
-                agent_id,
+                aid,
                 "system.claimed",
                 "system",
                 sys_obj["id"],
-                f"Agent '{agent_id}' claimed {sys_obj['system_type']} '{sys_obj['name']}'",
+                f"Agent '{aid}' claimed {sys_obj['system_type']} '{sys_obj['name']}'",
                 {"lease_until": lease_until},
             )
             return self.get_system(project_id, sys_obj["id"], conn=conn)
-
-    def _compute_post_audit_system_status(
-        self,
-        conn: sqlite3.Connection,
-        system_id: str,
-        current_status: str,
-        requested_status: Optional[str],
-    ) -> str:
-        """Prevent systems with open critical/high findings from being marked 'reviewed' or 'healthy' (F-02, RF-01)."""
-        open_crit_high = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt FROM findings
-            WHERE system_id = ?
-              AND severity IN ('critical', 'high')
-              AND status NOT IN ('resolved', 'wont_fix')
-            """,
-            (system_id,),
-        ).fetchone()["cnt"]
-
-        if open_crit_high > 0:
-            if requested_status in (None, "reviewed", "healthy", "unreviewed"):
-                return "needs_attention"
-            return requested_status
-        if requested_status:
-            return requested_status
-        active_tasks = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt FROM tasks
-            WHERE system_id = ? AND status IN ('open', 'claimed')
-            """,
-            (system_id,),
-        ).fetchone()["cnt"]
-        if active_tasks > 0 and current_status == "in_progress":
-            return "in_progress"
-        return "reviewed" if current_status == "in_progress" else current_status
 
     def release_system(
         self,
@@ -1014,11 +1036,11 @@ class AuditDB:
         details_append: Optional[str] = None,
         force: bool = False,
     ) -> Dict[str, Any]:
-        """Release system lock with ownership validation and full agent roster cleanup (F-13)."""
+        """Release system lock with ownership validation and full agent roster cleanup (F-13, RF-01)."""
         validated_health = validate_health_score(health_score)
         now = utc_now_iso()
         with self.connect(immediate=True) as conn:
-            self._ensure_agent_in_conn(conn, agent_id, project_id)
+            aid = self._ensure_agent_in_conn(conn, agent_id, project_id)
             sys_obj = self._resolve_system_in_conn(conn, project_id, system_ref)
             if not sys_obj:
                 raise ValueError(f"System '{system_ref}' not found.")
@@ -1030,7 +1052,7 @@ class AuditDB:
                 and not force
                 and lease_until
                 and lease_until > now
-                and agent_id != holder
+                and aid != holder
             ):
                 raise RuntimeError(
                     f"Cannot release system '{sys_obj['name']}': currently claimed by '{holder}' until {lease_until} (pass force=True to override)."
@@ -1043,7 +1065,7 @@ class AuditDB:
             new_details = sys_obj["details"] or ""
             if details_append:
                 sep = "\n\n" if new_details else ""
-                new_details = f"{new_details}{sep}[{now} by {agent_id or holder or 'agent'}]: {details_append}"
+                new_details = f"{new_details}{sep}[{now} by {aid or holder or 'agent'}]: {details_append}"
 
             conn.execute(
                 """
@@ -1054,9 +1076,8 @@ class AuditDB:
                     last_audited_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (new_status, new_health, new_details, agent_id, holder, now, now, sys_obj["id"]),
+                (new_status, new_health, new_details, aid, holder, now, now, sys_obj["id"]),
             )
-            # Clear current_system_id on both the previous holder and caller so no agent stays desynchronized (F-13)
             conn.execute(
                 "UPDATE agents SET current_system_id = NULL WHERE current_system_id = ?",
                 (sys_obj["id"],),
@@ -1064,7 +1085,7 @@ class AuditDB:
             self._log_event(
                 conn,
                 project_id,
-                agent_id or holder,
+                aid or holder,
                 "system.released",
                 "system",
                 sys_obj["id"],
@@ -1225,7 +1246,7 @@ class AuditDB:
         now = utc_now_iso()
         norm_crit = (criticality or "medium").strip().lower()
         with self.connect(immediate=True) as conn:
-            self._ensure_agent_in_conn(conn, agent_id, project_id)
+            aid = self._ensure_agent_in_conn(conn, agent_id, project_id)
             src = self._resolve_system_in_conn(conn, project_id, source_ref)
             if not src:
                 raise ValueError(f"Source system '{source_ref}' not found.")
@@ -1262,7 +1283,7 @@ class AuditDB:
                         norm_crit,
                         description,
                         details,
-                        agent_id,
+                        aid,
                         now,
                         rid,
                     ),
@@ -1289,7 +1310,7 @@ class AuditDB:
                         norm_crit,
                         description,
                         details,
-                        agent_id,
+                        aid,
                         now,
                         now,
                     ),
@@ -1298,7 +1319,7 @@ class AuditDB:
             self._log_event(
                 conn,
                 project_id,
-                agent_id,
+                aid,
                 "relation.recorded",
                 "relation",
                 rid,
@@ -1377,13 +1398,15 @@ class AuditDB:
         claim_immediately_for: Optional[str] = None,
         max_attempts: int = 3,
     ) -> Dict[str, Any]:
+        if not title or not str(title).strip():
+            raise ValueError("Task title is required.")
         now = utc_now_iso()
         norm_priority = (priority or "medium").strip().lower()
         if norm_priority not in VALID_PRIORITIES:
             raise ValueError(f"Invalid priority '{priority}'. Must be one of {VALID_PRIORITIES}.")
         with self.connect(immediate=True) as conn:
-            self._ensure_agent_in_conn(conn, created_by, project_id)
-            self._ensure_agent_in_conn(conn, claim_immediately_for, project_id)
+            creator_id = self._ensure_agent_in_conn(conn, created_by, project_id)
+            claimer_id = self._ensure_agent_in_conn(conn, claim_immediately_for, project_id)
 
             system_id = None
             sys_obj = None
@@ -1393,19 +1416,19 @@ class AuditDB:
                     raise ValueError(f"System '{system_ref}' not found.")
                 system_id = sys_obj["id"]
 
-            if claim_immediately_for and sys_obj:
+            if claimer_id and sys_obj:
                 holder = sys_obj["claimed_by"]
                 lease = sys_obj["lease_until"]
-                if holder and holder != claim_immediately_for and lease and lease > now:
+                if holder and holder != claimer_id and lease and lease > now:
                     raise RuntimeError(
-                        f"Cannot immediately claim task for '{claim_immediately_for}': target system '{sys_obj['name']}' is leased by '{holder}' until {lease}."
+                        f"Cannot immediately claim task for '{claimer_id}': target system '{sys_obj['name']}' is leased by '{holder}' until {lease}."
                     )
 
             tid = short_id("task")
-            status = "claimed" if claim_immediately_for else "open"
-            claimed_at = now if claim_immediately_for else None
-            lease_until = future_utc_iso(30) if claim_immediately_for else None
-            attempt_count = 1 if claim_immediately_for else 0
+            status = "claimed" if claimer_id else "open"
+            claimed_at = now if claimer_id else None
+            lease_until = future_utc_iso(30) if claimer_id else None
+            attempt_count = 1 if claimer_id else 0
 
             conn.execute(
                 """
@@ -1420,28 +1443,31 @@ class AuditDB:
                     tid,
                     project_id,
                     system_id,
-                    title,
+                    title.strip(),
                     task_type,
                     norm_priority,
                     status,
                     description,
-                    claim_immediately_for,
+                    claimer_id,
                     claimed_at,
                     lease_until,
                     attempt_count,
                     int(max_attempts),
-                    created_by,
+                    creator_id,
                     now,
                     now,
                 ),
             )
-            if claim_immediately_for:
+            if claimer_id:
                 conn.execute(
                     "UPDATE agents SET current_task_id = ?, current_system_id = COALESCE(?, current_system_id), last_heartbeat = ? WHERE id = ?",
-                    (tid, system_id, now, claim_immediately_for),
+                    (tid, system_id, now, claimer_id),
                 )
                 if system_id:
-                    # Also lock target system when claim_immediately_for is used (F-17)
+                    conn.execute(
+                        "UPDATE agents SET current_system_id = NULL WHERE current_system_id = ? AND id != ?",
+                        (system_id, claimer_id),
+                    )
                     conn.execute(
                         """
                         UPDATE systems
@@ -1450,17 +1476,17 @@ class AuditDB:
                             updated_at = ?
                         WHERE id = ?
                         """,
-                        (claim_immediately_for, now, lease_until, now, system_id),
+                        (claimer_id, now, lease_until, now, system_id),
                     )
 
             self._log_event(
                 conn,
                 project_id,
-                created_by or claim_immediately_for,
+                creator_id or claimer_id,
                 "task.created",
                 "task",
                 tid,
-                f"Created task '{title}' [{norm_priority} / {task_type}]",
+                f"Created task '{title.strip()}' [{norm_priority} / {task_type}]",
                 {"system_id": system_id, "priority": norm_priority, "status": status},
             )
             return self._get_task_in_conn(conn, tid)
@@ -1489,27 +1515,40 @@ class AuditDB:
         lease_minutes: int = 30,
         force: bool = False,
     ) -> Dict[str, Any]:
-        """Claim a specific task and acquire expired or unclaimed system leases safely (F-08)."""
+        """Claim a specific task, enforce max_attempts, and clean up stale agent pointers (F-08, RF-09, RF-12)."""
         now = utc_now_iso()
         lease_until = future_utc_iso(lease_minutes)
         with self.connect(immediate=True) as conn:
             t = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if not t:
                 raise ValueError(f"Task '{task_id}' not found.")
-            self._ensure_agent_in_conn(conn, agent_id, t["project_id"])
+            aid = self._ensure_agent_in_conn(conn, agent_id, t["project_id"])
+            if not aid:
+                raise ValueError("agent_id is required to claim a task.")
 
             if t["status"] == "completed" and not force:
                 raise RuntimeError(f"Task '{task_id}' is already completed.")
             if t["status"] == "blocked" and not force:
                 raise RuntimeError(f"Task '{task_id}' is blocked ({t['blocked_reason'] or 'max attempts exceeded'}).")
             if t["attempt_count"] >= t["max_attempts"] and not force:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'blocked',
+                        blocked_reason = 'Exceeded max_attempts (' || max_attempts || ')',
+                        lease_until = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, task_id),
+                )
                 raise RuntimeError(
-                    f"Task '{task_id}' has reached maximum attempts ({t['max_attempts']}). Pass force=True to override."
+                    f"Task '{task_id}' has reached max_attempts ({t['max_attempts']}) and is now blocked."
                 )
             if (
                 t["status"] == "claimed"
                 and t["claimed_by"]
-                and t["claimed_by"] != agent_id
+                and t["claimed_by"] != aid
                 and not force
                 and t["lease_until"]
                 and t["lease_until"] > now
@@ -1523,7 +1562,7 @@ class AuditDB:
                 if (
                     sys_row
                     and sys_row["claimed_by"]
-                    and sys_row["claimed_by"] != agent_id
+                    and sys_row["claimed_by"] != aid
                     and not force
                     and sys_row["lease_until"]
                     and sys_row["lease_until"] > now
@@ -1532,16 +1571,11 @@ class AuditDB:
                         f"Target system '{sys_row['name']}' is currently leased by agent '{sys_row['claimed_by']}' until {sys_row['lease_until']}."
                     )
 
-            # Clear previous agent's pointer if task was previously held by another agent (RF-12)
+            # Clear stale current_task_id on any previous agent holding this task (RF-12)
             conn.execute(
                 "UPDATE agents SET current_task_id = NULL WHERE current_task_id = ? AND id != ?",
-                (task_id, agent_id),
+                (task_id, aid),
             )
-            if t["system_id"]:
-                conn.execute(
-                    "UPDATE agents SET current_system_id = NULL WHERE current_system_id = ? AND id != ?",
-                    (t["system_id"], agent_id),
-                )
 
             conn.execute(
                 """
@@ -1550,7 +1584,7 @@ class AuditDB:
                     attempt_count = attempt_count + 1, updated_at = ?
                 WHERE id = ?
                 """,
-                (agent_id, now, lease_until, now, task_id),
+                (aid, now, lease_until, now, task_id),
             )
             conn.execute(
                 """
@@ -1559,10 +1593,14 @@ class AuditDB:
                     status = 'active', last_heartbeat = ?
                 WHERE id = ?
                 """,
-                (task_id, t["system_id"], now, agent_id),
+                (task_id, t["system_id"], now, aid),
             )
             if t["system_id"]:
-                # Acquire system lease if unclaimed, expired, owned by same agent, or forced (fixes F-08 COALESCE deadlock)
+                # Clear stale current_system_id on previous agent if we are acquiring the system lock (RF-12)
+                conn.execute(
+                    "UPDATE agents SET current_system_id = NULL WHERE current_system_id = ? AND id != ?",
+                    (t["system_id"], aid),
+                )
                 conn.execute(
                     """
                     UPDATE systems
@@ -1580,9 +1618,9 @@ class AuditDB:
                     WHERE id = ?
                     """,
                     (
-                        agent_id, now, 1 if force else 0, agent_id,
-                        agent_id, now, 1 if force else 0, now,
-                        agent_id, now, 1 if force else 0, lease_until,
+                        aid, now, 1 if force else 0, aid,
+                        aid, now, 1 if force else 0, now,
+                        aid, now, 1 if force else 0, lease_until,
                         now,
                         t["system_id"],
                     ),
@@ -1591,11 +1629,11 @@ class AuditDB:
             self._log_event(
                 conn,
                 t["project_id"],
-                agent_id,
+                aid,
                 "task.claimed",
                 "task",
                 task_id,
-                f"Agent '{agent_id}' claimed task '{t['title']}' ({task_id})",
+                f"Agent '{aid}' claimed task '{t['title']}' ({task_id})",
                 {"lease_until": lease_until, "system_id": t["system_id"]},
             )
             return self._get_task_in_conn(conn, task_id)
@@ -1608,13 +1646,15 @@ class AuditDB:
         system_ref: Optional[str] = None,
         lease_minutes: int = 30,
     ) -> Optional[Dict[str, Any]]:
-        """Atomically claim the highest-priority task without stealing active system leases or looping poison-pill tasks (F-03, F-18)."""
+        """Atomically claim the highest-priority task without stealing active system leases or wedging poison-pill tasks (F-03, F-18, RF-09, RF-12)."""
         now = utc_now_iso()
         lease_until = future_utc_iso(lease_minutes)
         with self.connect(immediate=True) as conn:
-            self._ensure_agent_in_conn(conn, agent_id, project_id)
+            aid = self._ensure_agent_in_conn(conn, agent_id, project_id)
+            if not aid:
+                raise ValueError("agent_id is required to claim next task.")
 
-            # First, transition any poison-pill tasks that have reached max_attempts into 'blocked' (F-18, RF-09)
+            # Auto-block any open or lease-expired claimed tasks that have reached max_attempts (F-18, RF-09)
             conn.execute(
                 """
                 UPDATE tasks
@@ -1630,7 +1670,7 @@ class AuditDB:
                 (now, project_id, now),
             )
 
-            params: List[Any] = [project_id, now, agent_id, now]
+            params: List[Any] = [project_id, now, aid, now]
             filters = ""
             if task_type:
                 filters += " AND t.task_type = ?"
@@ -1668,16 +1708,11 @@ class AuditDB:
                 return None
 
             tid = candidate["id"]
-            # Clear previous agent's pointer if task was previously held by another agent (RF-12)
+            # Clear stale current_task_id on any previous agent whose lease expired (RF-12)
             conn.execute(
                 "UPDATE agents SET current_task_id = NULL WHERE current_task_id = ? AND id != ?",
-                (tid, agent_id),
+                (tid, aid),
             )
-            if candidate["system_id"]:
-                conn.execute(
-                    "UPDATE agents SET current_system_id = NULL WHERE current_system_id = ? AND id != ?",
-                    (candidate["system_id"], agent_id),
-                )
 
             conn.execute(
                 """
@@ -1686,7 +1721,7 @@ class AuditDB:
                     attempt_count = attempt_count + 1, updated_at = ?
                 WHERE id = ?
                 """,
-                (agent_id, now, lease_until, now, tid),
+                (aid, now, lease_until, now, tid),
             )
             conn.execute(
                 """
@@ -1695,9 +1730,13 @@ class AuditDB:
                     status = 'active', last_heartbeat = ?
                 WHERE id = ?
                 """,
-                (tid, candidate["system_id"], now, agent_id),
+                (tid, candidate["system_id"], now, aid),
             )
             if candidate["system_id"]:
+                conn.execute(
+                    "UPDATE agents SET current_system_id = NULL WHERE current_system_id = ? AND id != ?",
+                    (candidate["system_id"], aid),
+                )
                 conn.execute(
                     """
                     UPDATE systems
@@ -1707,17 +1746,17 @@ class AuditDB:
                     WHERE id = ?
                       AND (claimed_by IS NULL OR claimed_by = ? OR lease_until IS NULL OR lease_until < ?)
                     """,
-                    (agent_id, now, lease_until, now, candidate["system_id"], agent_id, now),
+                    (aid, now, lease_until, now, candidate["system_id"], aid, now),
                 )
 
             self._log_event(
                 conn,
                 project_id,
-                agent_id,
+                aid,
                 "task.claimed",
                 "task",
                 tid,
-                f"Agent '{agent_id}' atomically claimed next task '{candidate['title']}' ({tid})",
+                f"Agent '{aid}' atomically claimed next task '{candidate['title']}' ({tid})",
                 {"priority": candidate["priority"], "task_type": candidate["task_type"]},
             )
             return self._get_task_in_conn(conn, tid)
@@ -1729,29 +1768,27 @@ class AuditDB:
         reason: str = "Blocked during review",
         force: bool = False,
     ) -> Dict[str, Any]:
-        """Mark a task as 'blocked' and release its active lease with ownership verification (F-33, RF-06)."""
+        """Mark a task as 'blocked' with ownership validation, completion guards, and lock cleanup (F-33, RF-06)."""
         now = utc_now_iso()
         with self.connect(immediate=True) as conn:
             t = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if not t:
                 raise ValueError(f"Task '{task_id}' not found.")
-            if t["status"] == "completed":
-                raise RuntimeError(f"Cannot block task '{task_id}' because it is already completed.")
+            if t["status"] == "completed" and not force:
+                raise RuntimeError(f"Task '{task_id}' is already completed (pass force=True to override).")
 
+            aid = self._ensure_agent_in_conn(conn, agent_id, t["project_id"])
             holder = t["claimed_by"]
-            if holder and not force and agent_id and agent_id != holder:
+            if holder and not force and aid != holder:
                 raise RuntimeError(
-                    f"Task '{task_id}' is claimed by '{holder}', not '{agent_id}' (pass force=True to override)."
+                    f"Task '{task_id}' is claimed by '{holder}', not '{aid or 'anonymous'}' (pass force=True to override)."
                 )
 
-            effective_agent = agent_id or holder
-            self._ensure_agent_in_conn(conn, effective_agent, t["project_id"])
-
+            effective_agent = aid or holder
             conn.execute(
                 """
                 UPDATE tasks
                 SET status = 'blocked',
-                    claimed_by = NULL,
                     blocked_reason = ?,
                     lease_until = NULL,
                     updated_at = ?
@@ -1759,29 +1796,28 @@ class AuditDB:
                 """,
                 (reason, now, task_id),
             )
-            if holder:
-                conn.execute(
-                    "UPDATE agents SET current_task_id = NULL WHERE id = ? AND current_task_id = ?",
-                    (holder, task_id),
-                )
-                if t["system_id"]:
-                    other_active = conn.execute(
-                        "SELECT COUNT(*) AS cnt FROM tasks WHERE system_id = ? AND claimed_by = ? AND status = 'claimed' AND id != ?",
-                        (t["system_id"], holder, task_id),
-                    ).fetchone()["cnt"]
-                    if other_active == 0:
-                        conn.execute(
-                            "UPDATE agents SET current_system_id = NULL WHERE id = ? AND current_system_id = ?",
-                            (holder, t["system_id"]),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE systems
-                            SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ?
-                            WHERE id = ? AND claimed_by = ?
-                            """,
-                            (now, t["system_id"], holder),
-                        )
+            conn.execute(
+                "UPDATE agents SET current_task_id = NULL WHERE current_task_id = ?",
+                (task_id,),
+            )
+            if t["system_id"] and holder:
+                remaining_on_sys = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM tasks WHERE system_id = ? AND claimed_by = ? AND status = 'claimed' AND id != ?",
+                    (t["system_id"], holder, task_id),
+                ).fetchone()["cnt"]
+                if remaining_on_sys == 0:
+                    conn.execute(
+                        "UPDATE agents SET current_system_id = NULL WHERE id = ? AND current_system_id = ?",
+                        (holder, t["system_id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE systems
+                        SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ?
+                        WHERE id = ? AND claimed_by = ?
+                        """,
+                        (now, t["system_id"], holder),
+                    )
             self._log_event(
                 conn,
                 t["project_id"],
@@ -1803,7 +1839,7 @@ class AuditDB:
         system_health_score: Optional[int] = None,
         force: bool = False,
     ) -> Dict[str, Any]:
-        """Complete a claimed task with ownership checks, open-vulnerability status protection, and full agent cleanup (F-02, F-10, F-14, F-20, RF-01, RF-05, RF-07, RF-08)."""
+        """Complete a claimed task with strict ownership verification, multi-task lock preservation, and vulnerability protection (F-02, RF-01, RF-05, RF-07, RF-08)."""
         validated_health = validate_health_score(system_health_score)
         now = utc_now_iso()
         with self.connect(immediate=True) as conn:
@@ -1814,17 +1850,15 @@ class AuditDB:
             if t["status"] == "completed" and not force:
                 raise RuntimeError(f"Task '{task_id}' is already completed (pass force=True to overwrite).")
 
-            if t["status"] == "blocked" and not force:
-                raise RuntimeError(f"Task '{task_id}' is blocked ({t['blocked_reason'] or 'cannot complete without force=True'}).")
-
+            aid = self._ensure_agent_in_conn(conn, agent_id, t["project_id"])
             holder = t["claimed_by"]
-            if holder and not force and agent_id != holder:
+            # Strict ownership check: if claimed, caller MUST match holder (even if agent_id is None) unless force=True (RF-05)
+            if holder and not force and aid != holder:
                 raise RuntimeError(
-                    f"Task '{task_id}' is claimed by '{holder}', not '{agent_id or 'anonymous'}' (pass force=True to override)."
+                    f"Task '{task_id}' is claimed by '{holder}', not '{aid or 'anonymous'}' (pass force=True to override)."
                 )
 
-            effective_agent = agent_id or holder
-            self._ensure_agent_in_conn(conn, effective_agent, t["project_id"])
+            effective_agent = aid or holder
 
             conn.execute(
                 """
@@ -1840,25 +1874,39 @@ class AuditDB:
                 (effective_agent, deliverable_summary, now, now, task_id),
             )
 
-            remaining_active_tasks = 0
-            if t["system_id"] and effective_agent:
-                remaining_active_tasks = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM tasks WHERE system_id = ? AND claimed_by = ? AND status = 'claimed' AND id != ?",
+            # Clear current_task_id for any agent pointing to this task
+            conn.execute(
+                "UPDATE agents SET current_task_id = NULL WHERE current_task_id = ?",
+                (task_id,),
+            )
+
+            # Check if effective_agent still holds other claimed tasks on this system (RF-07)
+            remaining_agent_tasks = 0
+            if effective_agent and t["system_id"]:
+                remaining_agent_tasks = conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt FROM tasks
+                    WHERE system_id = ? AND claimed_by = ? AND status = 'claimed' AND id != ?
+                    """,
                     (t["system_id"], effective_agent, task_id),
                 ).fetchone()["cnt"]
 
             if effective_agent:
-                clear_system = (t["system_id"] is not None and remaining_active_tasks == 0)
-                conn.execute(
-                    """
-                    UPDATE agents
-                    SET current_task_id = CASE WHEN current_task_id = ? THEN NULL ELSE current_task_id END,
-                        current_system_id = CASE WHEN ? = 1 AND current_system_id = ? THEN NULL ELSE current_system_id END,
-                        last_heartbeat = ?
-                    WHERE id = ?
-                    """,
-                    (task_id, 1 if clear_system else 0, t["system_id"], now, effective_agent),
-                )
+                if remaining_agent_tasks == 0:
+                    conn.execute(
+                        """
+                        UPDATE agents
+                        SET current_system_id = CASE WHEN current_system_id = ? THEN NULL ELSE current_system_id END,
+                            last_heartbeat = ?
+                        WHERE id = ?
+                        """,
+                        (t["system_id"], now, effective_agent),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE agents SET last_heartbeat = ? WHERE id = ?",
+                        (now, effective_agent),
+                    )
 
             if t["system_id"]:
                 sys_row = conn.execute("SELECT * FROM systems WHERE id = ?", (t["system_id"],)).fetchone()
@@ -1866,7 +1914,8 @@ class AuditDB:
                     computed_status = self._compute_post_audit_system_status(
                         conn, t["system_id"], sys_row["status"], system_status
                     )
-                    release_system_claim = (effective_agent is not None and remaining_active_tasks == 0)
+                    should_release_sys = 1 if (effective_agent is not None and remaining_agent_tasks == 0) else 0
+                    # Only clear system lease if effective_agent is NOT NULL, owns the system lease, and has 0 remaining tasks on it (RF-07, RF-08)
                     conn.execute(
                         """
                         UPDATE systems
@@ -1881,9 +1930,9 @@ class AuditDB:
                         WHERE id = ?
                         """,
                         (
-                            1 if release_system_claim else 0, effective_agent,
-                            1 if release_system_claim else 0, effective_agent,
-                            1 if release_system_claim else 0, effective_agent,
+                            should_release_sys, effective_agent,
+                            should_release_sys, effective_agent,
+                            should_release_sys, effective_agent,
                             computed_status,
                             validated_health,
                             effective_agent,
@@ -1978,6 +2027,8 @@ class AuditDB:
         recommendation: str = "",
         status: str = "open",
     ) -> Dict[str, Any]:
+        if not title or not str(title).strip():
+            raise ValueError("Finding title is required.")
         now = utc_now_iso()
         norm_sev = (severity or "medium").strip().lower()
         if norm_sev not in VALID_SEVERITIES:
@@ -1986,7 +2037,7 @@ class AuditDB:
         norm_status = (status or "open").strip().lower()
 
         with self.connect(immediate=True) as conn:
-            self._ensure_agent_in_conn(conn, agent_id, project_id)
+            aid = self._ensure_agent_in_conn(conn, agent_id, project_id)
             system_id = None
             if system_ref:
                 sys_obj = self._resolve_system_in_conn(conn, project_id, system_ref)
@@ -2001,9 +2052,13 @@ class AuditDB:
                     raise ValueError(f"Related system '{related_system_ref}' not found.")
                 related_system_id = rel_obj["id"]
 
+            # Validate task_id before INSERT so non-existent tasks raise clean ValueError instead of IntegrityError (RF-14)
             if task_id:
-                t_row = conn.execute("SELECT id FROM tasks WHERE id = ? AND project_id = ?", (task_id, project_id)).fetchone()
-                if not t_row:
+                trow = conn.execute(
+                    "SELECT id FROM tasks WHERE id = ? AND project_id = ?",
+                    (task_id, project_id),
+                ).fetchone()
+                if not trow:
                     raise ValueError(f"Task '{task_id}' not found in project '{project_id}'.")
 
             fid = short_id("find")
@@ -2022,11 +2077,11 @@ class AuditDB:
                     system_id,
                     related_system_id,
                     task_id,
-                    agent_id,
+                    aid,
                     norm_sev,
                     norm_cat,
                     norm_status,
-                    title,
+                    title.strip(),
                     description,
                     details,
                     file_path,
@@ -2037,7 +2092,6 @@ class AuditDB:
                 ),
             )
 
-            # Transition system to needs_attention even when currently 'in_progress' (F-02)
             if system_id and norm_sev in ("critical", "high") and norm_status not in ("resolved", "wont_fix"):
                 conn.execute(
                     """
@@ -2052,11 +2106,11 @@ class AuditDB:
             self._log_event(
                 conn,
                 project_id,
-                agent_id,
+                aid,
                 "finding.logged",
                 "finding",
                 fid,
-                f"Logged [{norm_sev.upper()}] {norm_cat} finding: '{title}'",
+                f"Logged [{norm_sev.upper()}] {norm_cat} finding: '{title.strip()}'",
                 {"severity": norm_sev, "category": norm_cat, "system_id": system_id, "file_path": file_path},
             )
             row = conn.execute(
@@ -2087,7 +2141,7 @@ class AuditDB:
             f = conn.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
             if not f:
                 raise ValueError(f"Finding '{finding_id}' not found.")
-            self._ensure_agent_in_conn(conn, agent_id, f["project_id"])
+            aid = self._ensure_agent_in_conn(conn, agent_id, f["project_id"])
             conn.execute(
                 """
                 UPDATE findings
@@ -2101,7 +2155,7 @@ class AuditDB:
             self._log_event(
                 conn,
                 f["project_id"],
-                agent_id,
+                aid,
                 "finding.updated",
                 "finding",
                 finding_id,
@@ -2179,7 +2233,7 @@ class AuditDB:
             return _query(c)
 
     # -------------------------------------------------------------------------
-    # Audit Logs & Point-in-Time Consistent Project Snapshot (F-16)
+    # Audit Logs & Point-in-Time Consistent Project Snapshot (F-16, RF-15, RF-18)
     # -------------------------------------------------------------------------
     def list_logs(
         self,
@@ -2187,6 +2241,8 @@ class AuditDB:
         limit: int = 100,
         conn: Optional[sqlite3.Connection] = None,
     ) -> List[Dict[str, Any]]:
+        clamped_limit = max(1, min(int(limit), 500))  # Prevent SQLite LIMIT -1 pagination bypass (RF-15)
+
         def _query(c: sqlite3.Connection) -> List[Dict[str, Any]]:
             if project_id:
                 rows = c.execute(
@@ -2198,7 +2254,7 @@ class AuditDB:
                     ORDER BY l.created_at DESC
                     LIMIT ?
                     """,
-                    (project_id, limit),
+                    (project_id, clamped_limit),
                 ).fetchall()
             else:
                 rows = c.execute(
@@ -2209,7 +2265,7 @@ class AuditDB:
                     ORDER BY l.created_at DESC
                     LIMIT ?
                     """,
-                    (limit,),
+                    (clamped_limit,),
                 ).fetchall()
             return [dict(r) for r in rows]
 
@@ -2219,13 +2275,13 @@ class AuditDB:
             return _query(c)
 
     def get_project_snapshot(self, project_ref: Optional[str] = None) -> Dict[str, Any]:
-        """Assemble the entire project snapshot inside a single consistent read transaction (F-16, RF-18)."""
+        """Resolve project and assemble the entire snapshot inside a single consistent transaction (F-16, RF-18)."""
         with self.connect() as conn:
             project_id = self.resolve_project_id(project_ref, conn=conn)
-            p_row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-            if not p_row:
+            prow = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if not prow:
                 raise ValueError(f"Project '{project_id}' not found.")
-            project = dict(p_row)
+            project = dict(prow)
             projects = self.list_projects(conn=conn)
             systems = self.list_systems(project_id, conn=conn)
             relations = self.list_relations(project_id, conn=conn)
@@ -2337,13 +2393,12 @@ class AuditDB:
         for s in systems:
             by_parent.setdefault(s["parent_id"], []).append(s)
 
-        visited_sys = set()
+        visited_nodes = set()
 
         def render_sys(sys_item: Dict[str, Any], depth: int = 0) -> None:
-            sid = sys_item["id"]
-            if sid in visited_sys:
+            if sys_item["id"] in visited_nodes:
                 return
-            visited_sys.add(sid)
+            visited_nodes.add(sys_item["id"])
             indent = "  " * depth
             health = f"{sys_item['health_score']}/100" if sys_item["health_score"] is not None else "Unscored"
             claim_tag = f" | Claimed by `{sys_item['claimed_by']}`" if sys_item.get("claimed_by") else ""
@@ -2438,6 +2493,7 @@ class AuditDB:
     def seed_demo_data(self, reset_first: bool = True) -> Dict[str, Any]:
         prev_sync = self.auto_sync_snapshot
         self.auto_sync_snapshot = False
+        pid = "proj-horizon"
         try:
             if reset_first:
                 self.reset_database()
@@ -2450,11 +2506,10 @@ class AuditDB:
                     "audited by a coordinated fleet of specialized AI agents."
                 ),
                 details="Production codebase with 4 core systems, 8 specialized subsystems, gRPC/Kafka interconnects, and PostgreSQL/Redis stores.",
-                project_id="proj-horizon",
+                project_id=pid,
             )
             pid = proj["id"]
 
-            # Register 4 specialized agents
             self.register_agent(
                 agent_id="agent-atlas-01",
                 name="Atlas (Architecture Mapper)",
@@ -2488,7 +2543,6 @@ class AuditDB:
                 project_id=pid,
             )
 
-            # Top-level systems
             edge = self.upsert_system(
                 project_id=pid,
                 name="Edge API Gateway",
@@ -2538,7 +2592,6 @@ class AuditDB:
                 agent_id="agent-veritas-04",
             )
 
-            # Subsystems under Edge API Gateway
             self.upsert_system(
                 project_id=pid,
                 name="Rate Limiter & WAF Filter",
@@ -2566,7 +2619,6 @@ class AuditDB:
                 agent_id="agent-sentinel-02",
             )
 
-            # Subsystems under Identity & Access Engine
             self.upsert_system(
                 project_id=pid,
                 name="JWT & Refresh Token Issuer",
@@ -2594,7 +2646,6 @@ class AuditDB:
                 agent_id="agent-sentinel-02",
             )
 
-            # Subsystems under Order & Fulfillment Core
             self.upsert_system(
                 project_id=pid,
                 name="Checkout Saga Orchestrator",
@@ -2635,7 +2686,6 @@ class AuditDB:
                 agent_id="agent-pulse-03",
             )
 
-            # Subsystems under Telemetry & Audit Pipeline
             self.upsert_system(
                 project_id=pid,
                 name="Kafka Event Stream Consumer",
@@ -2650,7 +2700,6 @@ class AuditDB:
                 agent_id="agent-veritas-04",
             )
 
-            # Cross-System & Subsystem Relations ("Works With")
             self.add_relation(
                 project_id=pid,
                 source_ref="edge-gateway",
@@ -2736,7 +2785,6 @@ class AuditDB:
                 agent_id="agent-sentinel-02",
             )
 
-            # Tasks (Completed, Claimed, Open)
             t1 = self.create_task(
                 project_id=pid,
                 title="Map top-level systems, subsystem boundaries, and gRPC/Kafka contracts",
@@ -2805,7 +2853,6 @@ class AuditDB:
                 created_by="agent-pulse-03",
             )
 
-            # Findings
             self.add_finding(
                 project_id=pid,
                 title="Race window in Refresh Token Rotation allows parallel token minting before family revocation",
@@ -2897,4 +2944,4 @@ class AuditDB:
         finally:
             self.auto_sync_snapshot = prev_sync
             if self.auto_sync_snapshot:
-                self.sync_static_snapshot()
+                self.sync_static_snapshot(pid)
