@@ -91,10 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("seed-demo", parents=[sub_global], help="Seed database with a realistic multi-system, multi-agent audit demo")
     subparsers.add_parser("reset", parents=[sub_global], help="Clear all audit records and reset the database")
 
-    # serve
+    # serve & ui
     p_serve = subparsers.add_parser("serve", parents=[sub_global], help="Start the local Web UI & HTTP REST API server")
     p_serve.add_argument("--host", default="127.0.0.1", help="Host interface to bind (default: 127.0.0.1)")
     p_serve.add_argument("--port", type=int, default=8420, help="Port to bind (default: 8420)")
+    p_serve.add_argument("--open", action="store_true", help="Automatically open Web UI in default browser")
+
+    p_ui = subparsers.add_parser("ui", parents=[sub_global], help="1-command startup: start server and open Web UI in browser")
+    p_ui.add_argument("--host", default="127.0.0.1", help="Host interface to bind (default: 127.0.0.1)")
+    p_ui.add_argument("--port", type=int, default=8420, help="Port to bind (default: 8420)")
 
     # export
     p_export = subparsers.add_parser("export", parents=[sub_global], help="Export full audit report as Markdown or JSON")
@@ -261,9 +266,10 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
     try:
         db = AuditDB(db_path=args.db)
 
-        if args.command == "serve":
+        if args.command in ("serve", "ui"):
             db.ensure_default_project()
-            run_server(db, host=args.host, port=args.port)
+            should_open = getattr(args, "open", False) or (args.command == "ui")
+            run_server(db, host=args.host, port=args.port, open_browser=should_open)
             return 0
 
         if args.command == "init":

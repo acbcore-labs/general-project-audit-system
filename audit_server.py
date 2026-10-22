@@ -604,7 +604,7 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
             )
 
 
-def run_server(db: AuditDB, host: str = "127.0.0.1", port: int = 8420) -> None:
+def run_server(db: AuditDB, host: str = "127.0.0.1", port: int = 8420, open_browser: bool = False) -> None:
     AuditRequestHandler.db = db
     server = ThreadingHTTPServer((host, port), AuditRequestHandler)
 
@@ -616,11 +616,18 @@ def run_server(db: AuditDB, host: str = "127.0.0.1", port: int = 8420) -> None:
     except ValueError:
         pass
 
+    url = f"http://{host}:{port}"
     print("==================================================================")
     print("  Multi-Agent Project Audit System — Web UI & REST API")
-    print(f"  URL:      http://{host}:{port}")
+    print(f"  URL:      {url}")
     print(f"  Database: {db.db_path}")
     print("==================================================================")
+
+    if open_browser:
+        import threading
+        import webbrowser
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
