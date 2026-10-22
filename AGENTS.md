@@ -49,6 +49,7 @@ Do not register duplicate agents under the same role if other disciplines are va
 
 | Role Slug | Primary Task Types | Focus & Responsibilities |
 | :--- | :--- | :--- |
+| **`audit-lead`** | *All task types* | Orchestrates the audit sprint, conducts macro sweeps, resolves coverage imbalances, de-duplicates findings, reaps zombie leases, and signs off on subsystem health. |
 | **`arch-mapper`** | `architecture_map`, `subsystem_audit` | Maps system/subsystem hierarchy, path scopes, architectural boundaries, and baseline component health. |
 | **`security-auditor`** | `security_review`, `bug_hunt` | Audits authentication, RBAC, input validation, cryptographic primitives, secrets, and authorization boundaries. |
 | **`performance-reviewer`** | `performance_review` | Audits database queries, N+1 patterns, async bottlenecks, race conditions, memory leaks, and throughput budgets. |
@@ -172,11 +173,33 @@ This automatically queues the 4 standard review tasks for the system:
 
 ---
 
-## 7. Command Reference Cheat-Sheet
+## 7. The Audit Lead / Scrum Master Sweep (`./audit sweep`)
+
+When acting as an **`audit-lead`** or checking global sprint health, run periodic sweeps to inspect the big picture:
+
+```bash
+# 1. Run a dry-run sweep to inspect queue health and imbalances
+./audit sweep
+
+# 2. Or automatically reap zombie leases, scaffold missing tasks, and sign off completed systems
+./audit sweep --fix
+```
+
+The sweep engine automatically:
+- 🧟 **Reaps Zombie Claims**: Detects tasks and systems locked by dead or offline agents whose leases expired, reopening them safely.
+- 📋 **Identifies Unscaffolded Systems**: Flags newly mapped components lacking standard review tasks (and auto-scaffolds them if `--fix` is passed).
+- 🔍 **Flags Duplicate Findings**: Detects overlapping findings sharing identical titles or line ranges for de-duplication.
+- ⚖️ **Detects Workforce Imbalances**: Alerts when key disciplines are vacant or agents are crowded into one hotspot.
+- 🎯 **Milestone Sign-Off**: Identifies subsystems where all review disciplines are finished and promotes them to `reviewed` or `healthy`.
+
+---
+
+## 8. Command Reference Cheat-Sheet
 
 | Action | Command |
 | :--- | :--- |
 | **Show Mission Board** | `./audit board [--json]` |
+| **Run Orchestrator Sweep** | `./audit sweep [--fix]` |
 | **Check Workforce Roster** | `./audit agent roster [--json]` |
 | **Resume Interrupted Session** | `./audit resume --agent <id>` |
 | **Claim Next Task (Role-Aware)**| `./audit task next --agent <id>` |
@@ -187,4 +210,5 @@ This automatically queues the 4 standard review tasks for the system:
 | **Register Agent** | `./audit agent register --id <id> --role <role>` |
 | **Log Finding** | `./audit finding add --title "..." --severity critical` |
 | **Complete Task** | `./audit task complete <id> --summary "..."` |
+| **Start Web UI & REST Server** | `./audit serve` |
 | **Start Web UI & REST Server** | `./audit serve` |

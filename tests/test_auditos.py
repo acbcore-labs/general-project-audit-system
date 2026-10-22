@@ -561,6 +561,22 @@ class TestAuditOSRemediation(unittest.TestCase):
         self.assertEqual(h_resume.status_code, 200)
         self.assertEqual(h_resume.get_json()["active_task"]["id"], arch_task["id"])
 
+        # Test audit lead / sweep functionality
+        sweep_dry = self.db.run_sweep(pid, auto_fix=False)
+        self.assertFalse(sweep_dry["auto_fix"])
+        self.assertIn("zombies", sweep_dry)
+        self.assertIn("unscaffolded", sweep_dry)
+
+        # Test sweep with auto_fix
+        sweep_fix = self.db.run_sweep(pid, auto_fix=True)
+        self.assertTrue(sweep_fix["auto_fix"])
+
+        # Test REST /api/sweep
+        h_sweep = MockRequestHandler(self.db, "GET", f"/api/sweep?project={pid}")
+        h_sweep.do_GET()
+        self.assertEqual(h_sweep.status_code, 200)
+        self.assertIn("zombies", h_sweep.get_json())
+
 
 if __name__ == "__main__":
     unittest.main()

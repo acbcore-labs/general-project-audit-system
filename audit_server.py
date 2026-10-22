@@ -168,6 +168,12 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(board)
                 return
 
+            if path == "/api/sweep":
+                project_ref = q1("project")
+                res = self.db.run_sweep(project_ref=project_ref, auto_fix=False)
+                self._send_json(res)
+                return
+
             if path == "/api/roles":
                 pid = self.db.resolve_project_id(q1("project")) if q1("project") else None
                 self._send_json(self.db.list_roles(pid))
@@ -515,6 +521,13 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
                     checkpoint_type=body.get("checkpoint_type", "scratchpad"),
                 )
                 self._send_json(chk, status=201)
+                return
+
+            if path == "/api/sweep":
+                pid = self.db.resolve_project_id(body.get("project_id")) if body.get("project_id") else None
+                auto_fix = bool(body.get("auto_fix", False))
+                res = self.db.run_sweep(project_ref=pid, auto_fix=auto_fix, agent_id=agent_id)
+                self._send_json(res)
                 return
 
             if path == "/api/findings":

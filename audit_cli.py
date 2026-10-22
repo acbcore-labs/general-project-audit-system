@@ -52,6 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
     # board
     subparsers.add_parser("board", parents=[sub_global], help="Show live multi-agent mission blackboard & coverage matrix")
 
+    # sweep & lead (Orchestrator)
+    p_sweep = subparsers.add_parser("sweep", parents=[sub_global], help="Run audit orchestrator sweep: detect zombies, unscaffolded systems, duplicates, and sign-offs")
+    p_sweep.add_argument("--fix", action="store_true", help="Automatically remediate: reap zombies, scaffold missing tasks, and sign off completed systems")
+
+    p_lead = subparsers.add_parser("lead", parents=[sub_global], help="Audit lead / scrum master briefing and queue re-balancing")
+    p_lead.add_argument("--fix", action="store_true", help="Automatically remediate discovered queue issues")
+
     # resume & revert
     p_resume = subparsers.add_parser("resume", parents=[sub_global], help="Resume an interrupted agent session, extend leases, and restore working context")
     p_resume.add_argument("--lease", type=int, default=30, help="Minutes to extend active leases")
@@ -360,6 +367,58 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
                 for rec in b["recommendations"]:
                     lines.append(f"  * {rec}")
             print_output(b, args.json, lines)
+            return 0
+
+        if args.command in ("sweep", "lead"):
+            res = db.run_sweep(
+                project_ref=args.project,
+                auto_fix=getattr(args, "fix", False),
+                agent_id=args.agent,
+            )
+            lines = [
+                f"=== Audit Lead & Orchestration Sweep: {res['project']['name']} ===",
+                f"Mode: {'Auto-Remediation Enabled (--fix)' if res['auto_fix'] else 'Dry Run / Inspection (Pass --fix to remediate)'}",
+                f"Timestamp: {res['timestamp']}",
+                "",
+            ]
+
+            if res["zombies"]:
+                lines.append(f"🧟 Stalled & Zombie Claims ({len(res['zombies'])}):")
+                for z in res["zombies"]:
+                    lines.append(f"  * [{z['type'].upper()}] {z.get('title') or z.get('name')} (Claimed by: @{z['claimed_by']}, Reason: {z['reason']})")
+            else:
+                lines.append("🧟 Stalled & Zombie Claims: None (Queue is clean)")
+
+            if res["unscaffolded"]:
+                lines.append(f"\n📋 Unscaffolded Systems ({len(res['unscaffolded'])}):")
+                for u in res["unscaffolded"]:
+                    lines.append(f"  * {u['name']} ({u['slug']}) — Missing: {', '.join(u['missing_types'])}")
+            else:
+                lines.append("\n📋 Unscaffolded Systems: None (All systems have standard task suites)")
+
+            if res["duplicates"]:
+                lines.append(f"\n🔍 Potential Duplicate Findings ({len(res['duplicates'])}):")
+                for d in res["duplicates"]:
+                    lines.append(f"  * [{d['reason']}] '{d['finding_a']['title']}' <-> '{d['finding_b']['title']}' in {d['file']}")
+            else:
+                lines.append("\n🔍 Potential Duplicate Findings: None detected")
+
+            if res["imbalances"]:
+                lines.append(f"\n⚖️ Workforce & Coverage Imbalances:")
+                for imb in res["imbalances"]:
+                    lines.append(f"  * {imb}")
+
+            if res["ready_for_signoff"]:
+                lines.append(f"\n🎯 Systems Ready for Milestone Sign-Off ({len(res['ready_for_signoff'])}):")
+                for s in res["ready_for_signoff"]:
+                    lines.append(f"  * {s['name']} ({s['slug']}) — Calibrated Status: {s['calibrated_status'].upper()} (Health: {s['health_score'] or 'N/A'}, Open findings: {s['open_findings']})")
+
+            if res["actions_taken"]:
+                lines.append(f"\n⚡ Actions Executed ({len(res['actions_taken'])}):")
+                for act in res["actions_taken"]:
+                    lines.append(f"  + {act}")
+
+            print_output(res, args.json, lines)
             return 0
 
         if args.command == "resume":

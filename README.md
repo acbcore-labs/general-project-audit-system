@@ -66,6 +66,7 @@ Give any LLM/coding agent the instructions in [`AGENT_GUIDE.md`](./AGENT_GUIDE.m
 | `./audit init --name "..." [--root "..."]` | Initialize a new project in the audit database |
 | `./audit status [--json]` | Show coverage metrics, active agents, task queue, and findings summary |
 | `./audit board [--json]` | Live Multi-Agent Mission Blackboard & coverage matrix across disciplines |
+| `./audit sweep [--fix]` | Run audit orchestrator sweep: reap zombies, scaffold gaps, and check sign-offs |
 | `./audit resume --agent <id>` | Resume an interrupted agent session, extend leases, and restore scratchpad |
 | `./audit revert --agent <id> [--reason "..."]` | Cleanly release all active task/system claims held by an agent |
 | `./audit checkpoint save --agent <id> --notes "..."` | Save draft progress, scratch notes, or audit state for an agent session |
