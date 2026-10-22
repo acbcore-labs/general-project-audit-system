@@ -111,9 +111,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_agent_reg = agent_sub.add_parser("register", parents=[sub_global], help="Register or update an agent worker identity")
     p_agent_reg.add_argument("--id", default=None, help="Unique agent ID (e.g., agent-sec-01)")
-    p_agent_reg.add_argument("--name", required=True, help="Human-friendly agent name")
+    p_agent_reg.add_argument("--name", default=None, help="Human-friendly agent name (defaults to agent ID if omitted)")
     p_agent_reg.add_argument("--role", default="general-auditor", help="Agent specialty/role (e.g., architecture-mapper, security-auditor, performance-reviewer)")
-    p_agent_reg.add_argument("--model", default="", help="Underlying model or worker runtime")
+    p_agent_reg.add_argument("--model", default="", help="Optional model or worker runtime tag")
     p_agent_reg.add_argument("--capabilities", default="", help="Comma-separated capabilities or focus areas")
 
     p_agent_hb = agent_sub.add_parser("heartbeat", parents=[sub_global], help="Send agent heartbeat and extend active task/system leases")

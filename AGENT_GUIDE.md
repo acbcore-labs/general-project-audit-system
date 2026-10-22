@@ -33,6 +33,7 @@ To inspect existing project status and hierarchy:
 ```
 
 ### Step 2: Register Your Agent Identity
+AuditOS is provider-agnostic and subscription-friendly: any LLM agent (Claude Code, Grok, Gemini CLI, Cursor, OpenHands) can jump in without configuring API keys or model arguments.
 ```bash
 export AUDIT_AGENT_ID="agent-sec-01"
 
@@ -40,7 +41,6 @@ export AUDIT_AGENT_ID="agent-sec-01"
   --id "$AUDIT_AGENT_ID" \
   --name "Sentinel (Security & Auth Auditor)" \
   --role "security-auditor" \
-  --model "gemini-2.5-pro" \
   --capabilities "auth,jwt,sql-injection,access-control"
 ```
 

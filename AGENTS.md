@@ -1,7 +1,9 @@
 # Multi-Agent Operating Manual (`AGENTS.md`)
 
-> **Notice to Autonomous AI Agents (Claude Code, Gemini CLI, Cursor, Codex, OpenHands)**:
+> **Notice to Autonomous AI Agents (Claude Code, Grok, Gemini CLI, Cursor, Codex, OpenHands)**:
 > This repository is managed via a local multi-agent architecture and codebase auditing engine (`audit.db` + `./audit` CLI + HTTP REST API). Multiple agents can audit concurrently with zero write collisions, atomic task dispatching, and state checkpointing.
+> 
+> **Zero API / Model Lock-In**: AuditOS does **not** invoke LLMs or manage model credentials. It is a shared coordination kernel. You run under your user's existing subscription (Claude, Grok, Gemini, ChatGPT). The `--model` flag is completely optional. Any agent from any provider can jump into any vacant role, inspect the blackboard, claim tasks, and resume work without missing a beat.
 
 ---
 
@@ -15,7 +17,7 @@ export AUDIT_AGENT_ID="agent-sec-01"
 # 2. Check the active workforce roster and pick a vacant role
 ./audit agent roster
 
-# 3. Register your agent identity with your chosen specialty
+# 3. Register your agent identity with your chosen specialty (no model or API key required!)
 ./audit agent register \
   --id "$AUDIT_AGENT_ID" \
   --name "Sentinel (Security Auditor)" \
@@ -27,6 +29,17 @@ export AUDIT_AGENT_ID="agent-sec-01"
 
 # 5. Atomically claim your next task (automatically matches your role!)
 ./audit task next --json
+```
+
+### Auditing Specific Target Repositories (Multi-Repo Workbench)
+If multiple target codebases are being audited in the portfolio, simply specify the target repo slug via `--project`:
+```bash
+# Check the multi-project target portfolio
+./audit portfolio
+
+# Target a specific repository/codebase
+./audit board --project "order-core"
+./audit task next --project "order-core" --json
 ```
 
 ### Resuming an Interrupted Session ("Pick Back Up Without Skipping a Beat")
