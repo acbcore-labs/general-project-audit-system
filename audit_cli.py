@@ -52,6 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     # board
     subparsers.add_parser("board", parents=[sub_global], help="Show live multi-agent mission blackboard & coverage matrix")
 
+    # portfolio
+    subparsers.add_parser("portfolio", parents=[sub_global], help="Show multi-target repository portfolio overview across all projects")
+
     # sweep & lead (Orchestrator)
     p_sweep = subparsers.add_parser("sweep", parents=[sub_global], help="Run audit orchestrator sweep: detect zombies, unscaffolded systems, duplicates, and sign-offs")
     p_sweep.add_argument("--fix", action="store_true", help="Automatically remediate: reap zombies, scaffold missing tasks, and sign off completed systems")
@@ -326,6 +329,30 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
                 f"[CRIT: {sc['critical']}, HIGH: {sc['high']}, MED: {sc['medium']}, LOW: {sc['low']}, INFO: {sc['info']}]",
             ]
             print_output(snap["metrics"], args.json, lines)
+            return 0
+
+        if args.command == "portfolio":
+            summary = db.get_portfolio_summary()
+            lines = [
+                f"=== TARGET REPOSITORIES PORTFOLIO ({len(summary)} project(s) registered) ===",
+                "",
+                "PROJECT / TARGET REPO            SYSTEMS   HEALTH   OPEN FINDINGS (C/H/M/L)   WORKFORCE   TASKS",
+                "─" * 96,
+            ]
+            for item in summary:
+                p = item["project"]
+                m = item["metrics"]
+                sc = m["severity_counts"]
+                tc = m["task_counts"]
+                name_disp = f"{p['name']} ({p['slug']})"[:30].ljust(30)
+                sys_disp = f"{m['total_systems']} sys · {m['total_subsystems']} sub"[:10].center(10)
+                health_disp = f"{m['avg_health_score']}/100" if m["avg_health_score"] is not None else " unscored"
+                health_disp = health_disp.center(9)
+                find_disp = f"{m['open_findings']} open ({sc['critical']}C·{sc['high']}H·{sc['medium']}M·{sc['low']}L)"[:25].ljust(25)
+                agents_disp = f"{m['active_agents']} active / {m['total_agents']} total"[:12].center(12)
+                task_disp = f"{tc['completed']}/{m['total_tasks']} done"
+                lines.append(f"{name_disp} {sys_disp} {health_disp} {find_disp} {agents_disp} {task_disp}")
+            print_output(summary, args.json, lines)
             return 0
 
         if args.command == "board":

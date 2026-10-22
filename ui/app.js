@@ -93,6 +93,7 @@ function renderAll() {
   if (!state.snapshot) return;
   renderTopbar();
   renderMetrics();
+  renderPortfolioTab();
   renderSystemsExplorer();
   renderTopologyTab();
   renderWorkforceTab();
@@ -182,6 +183,131 @@ function healthBadge(score) {
   const n = Number(score);
   const cls = n >= 85 ? "badge-healthy" : n >= 70 ? "badge-medium" : "badge-critical";
   return `<span class="badge ${cls}">${n}/100</span>`;
+}
+
+/* =========================================================================
+   TAB 0: TARGET REPOSITORIES PORTFOLIO
+   ========================================================================= */
+async function renderPortfolioTab() {
+  const container = document.getElementById("portfolioContainer");
+  if (!container) return;
+
+  let portfolioList = [];
+  try {
+    if (window.location.protocol !== "file:") {
+      const res = await api("/api/portfolio");
+      portfolioList = res.portfolio || [];
+    }
+  } catch (err) {
+    // fallback to snapshot projects
+  }
+
+  if (portfolioList.length === 0 && state.snapshot?.projects) {
+    portfolioList = state.snapshot.projects.map((p) => {
+      const isCurrent = p.id === state.snapshot.project.id;
+      return {
+        project: p,
+        metrics: isCurrent
+          ? state.snapshot.metrics
+          : {
+              total_systems: 0,
+              total_subsystems: 0,
+              total_components: 0,
+              reviewed_components: 0,
+              coverage_pct: 0,
+              avg_health_score: null,
+              total_findings: 0,
+              open_findings: 0,
+              severity_counts: { critical: 0, high: 0, medium: 0, low: 0, info: 0 },
+              total_tasks: 0,
+              task_counts: { open: 0, claimed: 0, completed: 0, blocked: 0 },
+              total_agents: 0,
+              active_agents: 0,
+            },
+      };
+    });
+  }
+
+  const cardsHtml = portfolioList
+    .map((item) => {
+      const p = item.project;
+      const m = item.metrics;
+      const isActive = p.id === state.activeProjectId;
+      const sc = m.severity_counts || {};
+      const tc = m.task_counts || {};
+
+      let healthBadgeClass = "badge-unreviewed";
+      let healthBadgeText = "Unscored";
+      if (m.avg_health_score !== null && m.avg_health_score !== undefined) {
+        if (m.avg_health_score >= 85) {
+          healthBadgeClass = "badge-healthy";
+          healthBadgeText = `${m.avg_health_score} / 100`;
+        } else if (m.avg_health_score >= 70) {
+          healthBadgeClass = "badge-reviewed";
+          healthBadgeText = `${m.avg_health_score} / 100`;
+        } else {
+          healthBadgeClass = "badge-attention";
+          healthBadgeText = `${m.avg_health_score} / 100`;
+        }
+      }
+
+      return `
+        <div class="portfolio-card ${isActive ? "active-target" : ""}" data-id="${esc(p.id)}">
+          <div class="portfolio-card-header">
+            <div>
+              <div class="portfolio-card-title">${esc(p.name)}</div>
+              <div class="portfolio-card-slug">${esc(p.slug)} · <code>${esc(p.id)}</code></div>
+            </div>
+            <span class="badge ${healthBadgeClass}">${healthBadgeText}</span>
+          </div>
+
+          ${p.root_path ? `<div class="portfolio-card-path" title="${esc(p.root_path)}">📁 ${esc(p.root_path)}</div>` : ""}
+          ${p.description ? `<p style="font-size:12px;color:var(--text-dim);margin:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">${esc(p.description)}</p>` : ""}
+
+          <div class="portfolio-stats-row">
+            <div>
+              <div class="portfolio-stat-val">${m.total_systems} / ${m.total_subsystems}</div>
+              <div class="portfolio-stat-lbl">Sys / Sub</div>
+            </div>
+            <div>
+              <div class="portfolio-stat-val" style="color:${m.open_findings > 0 ? (sc.critical > 0 ? 'var(--badge-crit-text, #ef4444)' : 'var(--badge-high-text, #f59e0b)') : 'var(--text-main)'}">
+                ${m.open_findings}
+              </div>
+              <div class="portfolio-stat-lbl">Open Bugs</div>
+            </div>
+            <div>
+              <div class="portfolio-stat-val">${m.active_agents} / ${m.total_agents}</div>
+              <div class="portfolio-stat-lbl">Agents</div>
+            </div>
+          </div>
+
+          <div style="font-size:11.5px;color:var(--text-dim);display:flex;justify-content:space-between;">
+            <span>Coverage: <strong>${m.coverage_pct}%</strong></span>
+            <span>Tasks: <strong>${tc.completed || 0}/${m.total_tasks}</strong></span>
+          </div>
+
+          <div class="portfolio-card-footer">
+            ${
+              isActive
+                ? `<span style="font-size:11.5px;color:var(--badge-healthy-text);font-weight:600;">● Active Workbench</span>`
+                : `<button class="btn btn-sm btn-primary" data-action="focus-workbench" data-id="${esc(p.id)}">🎯 Open Workbench</button>`
+            }
+            <button class="btn btn-sm btn-ghost" data-action="export-portfolio-project" data-id="${esc(p.id)}" title="Download Markdown Report">↓ Export</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  const addCardHtml = `
+    <div class="portfolio-card portfolio-add-card" id="cardAddProject">
+      <div style="font-size:32px;margin-bottom:8px;">+</div>
+      <div style="font-weight:600;font-size:14px;">Add Target Repository</div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:4px;">Configure a new codebase for multi-agent auditing</div>
+    </div>
+  `;
+
+  container.innerHTML = cardsHtml + addCardHtml;
 }
 
 /* =========================================================================
@@ -1696,6 +1822,15 @@ document.addEventListener("DOMContentLoaded", () => {
       case "block-task":
         blockTaskPromptById(id);
         break;
+      case "focus-workbench":
+        state.activeProjectId = id;
+        state.selectedSystemId = null;
+        switchTab("systems");
+        loadSnapshot(id);
+        break;
+      case "export-portfolio-project":
+        window.open(`/api/export/markdown?project=${encodeURIComponent(id)}`, "_blank");
+        break;
       default:
         break;
     }
@@ -1725,6 +1860,15 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   document.getElementById("btnNewProject").addEventListener("click", openNewProjectModal);
+  const btnNewProjPort = document.getElementById("btnNewProjectFromPortfolio");
+  if (btnNewProjPort) {
+    btnNewProjPort.addEventListener("click", openNewProjectModal);
+  }
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("#cardAddProject")) {
+      openNewProjectModal();
+    }
+  });
   document.getElementById("btnRegisterAgent").addEventListener("click", openRegisterAgentModal);
   document.getElementById("btnRegisterAgent2").addEventListener("click", openRegisterAgentModal);
   document.getElementById("btnRefresh").addEventListener("click", () => loadSnapshot());

@@ -74,6 +74,9 @@
 
   <!-- Main Navigation Tabs -->
   <nav class="nav-tabs">
+    <button class="tab-btn" data-tab="portfolio">
+      📁 Target Repos Portfolio
+    </button>
     <button class="tab-btn active" data-tab="systems">
       1. Systems & Subsystems Explorer
     </button>
@@ -93,6 +96,20 @@
 
   <!-- Main Workspace Container -->
   <main class="workspace">
+    <!-- TAB 0: TARGET REPOSITORIES PORTFOLIO -->
+    <section class="tab-panel" id="tab-portfolio">
+      <div class="panel-header">
+        <div>
+          <h2>Target Repositories & Workbenches</h2>
+          <p class="panel-subtitle">Multi-project portfolio overview — switch between target repositories or audit multiple systems concurrently.</p>
+        </div>
+        <div class="panel-actions">
+          <button class="btn btn-primary" id="btnNewProjectFromPortfolio">+ Add Target Repository</button>
+        </div>
+      </div>
+      <div class="portfolio-grid" id="portfolioContainer"></div>
+    </section>
+
     <!-- TAB 1: SYSTEMS & SUBSYSTEMS EXPLORER -->
     <section class="tab-panel active" id="tab-systems">
       <div class="split-layout">

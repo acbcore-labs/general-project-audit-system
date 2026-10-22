@@ -145,3 +145,83 @@ class ProjectRepositoryMixin:
                 return found
         proj = self.ensure_default_project()
         return proj["id"]
+
+    def get_portfolio_summary(
+        self, conn: Optional[sqlite3.Connection] = None
+    ) -> List[Dict[str, Any]]:
+        """Retrieve aggregated health, coverage, finding, and workforce metrics across all target projects."""
+        def _impl(c: sqlite3.Connection) -> List[Dict[str, Any]]:
+            projects = [dict(r) for r in c.execute("SELECT * FROM projects ORDER BY updated_at DESC").fetchall()]
+            if not projects:
+                return []
+
+            portfolio = []
+            for p in projects:
+                pid = p["id"]
+                # Systems metrics
+                sys_rows = c.execute(
+                    "SELECT id, parent_id, status, health_score FROM systems WHERE project_id = ?",
+                    (pid,),
+                ).fetchall()
+                top_systems = sum(1 for s in sys_rows if not s["parent_id"])
+                subsystems = sum(1 for s in sys_rows if s["parent_id"])
+                reviewed_systems = sum(
+                    1 for s in sys_rows if s["status"] in ("reviewed", "healthy", "needs_attention")
+                )
+                scored = [s["health_score"] for s in sys_rows if s["health_score"] is not None]
+                avg_health = round(sum(scored) / len(scored), 1) if scored else None
+
+                # Findings metrics
+                f_rows = c.execute(
+                    "SELECT severity, status FROM findings WHERE project_id = ?", (pid,)
+                ).fetchall()
+                sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+                open_findings = 0
+                for f in f_rows:
+                    sev = f["severity"]
+                    if sev in sev_counts:
+                        sev_counts[sev] += 1
+                    if f["status"] not in ("resolved", "wont_fix"):
+                        open_findings += 1
+
+                # Task metrics
+                t_rows = c.execute(
+                    "SELECT status FROM tasks WHERE project_id = ?", (pid,)
+                ).fetchall()
+                task_counts = {"open": 0, "claimed": 0, "completed": 0, "blocked": 0}
+                for t in t_rows:
+                    st = t["status"]
+                    if st in task_counts:
+                        task_counts[st] += 1
+
+                # Agent metrics
+                a_rows = c.execute(
+                    "SELECT status FROM agents WHERE project_id = ? OR project_id IS NULL",
+                    (pid,),
+                ).fetchall()
+                active_agents = sum(1 for a in a_rows if a["status"] == "active")
+
+                portfolio.append({
+                    "project": p,
+                    "metrics": {
+                        "total_systems": top_systems,
+                        "total_subsystems": subsystems,
+                        "total_components": len(sys_rows),
+                        "reviewed_components": reviewed_systems,
+                        "coverage_pct": round((reviewed_systems / len(sys_rows) * 100), 1) if sys_rows else 0.0,
+                        "avg_health_score": avg_health,
+                        "total_findings": len(f_rows),
+                        "open_findings": open_findings,
+                        "severity_counts": sev_counts,
+                        "total_tasks": len(t_rows),
+                        "task_counts": task_counts,
+                        "total_agents": len(a_rows),
+                        "active_agents": active_agents,
+                    },
+                })
+            return portfolio
+
+        if conn is not None:
+            return _impl(conn)
+        with self.connect() as c:
+            return _impl(c)

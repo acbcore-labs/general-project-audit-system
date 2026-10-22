@@ -198,6 +198,10 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"projects": self.db.list_projects()})
                 return
 
+            if path == "/api/portfolio":
+                self._send_json({"portfolio": self.db.get_portfolio_summary()})
+                return
+
             if path == "/api/agents":
                 pid = self.db.resolve_project_id(q1("project")) if q1("project") else None
                 self._send_json({"agents": self.db.list_agents(project_id=pid)})

@@ -640,6 +640,85 @@ class TestAuditOSRemediation(unittest.TestCase):
         self.assertIn("Reconstruction Key", report)
         self.assertIn("commit `a1b2c3d4`", report)
 
+    def test_multi_target_portfolio_and_workbench(self) -> None:
+        """Verify multi-target repository portfolio overview and per-project isolated workbenches."""
+        # Create two distinct target repository projects
+        proj_a = self.db.create_project(
+            name="Alpha Microservices",
+            root_path="/repos/alpha",
+            description="Alpha microservices platform",
+            project_id="proj-alpha",
+        )
+        proj_b = self.db.create_project(
+            name="Beta Data Platform",
+            root_path="/repos/beta",
+            description="Beta analytics and data lakehouse",
+            project_id="proj-beta",
+        )
+
+        # Populate Alpha with a system and a critical finding
+        self.db.upsert_system(
+            project_id="proj-alpha",
+            name="Auth Gateway",
+            slug="auth-gateway",
+            health_score=60,
+            status="needs_attention",
+        )
+        self.db.add_finding(
+            project_id="proj-alpha",
+            title="SQL Injection in auth route",
+            severity="critical",
+            system_ref="auth-gateway",
+        )
+
+        # Populate Beta with two healthy systems and zero findings
+        self.db.upsert_system(
+            project_id="proj-beta",
+            name="Ingestion Pipeline",
+            slug="ingestion-pipe",
+            health_score=95,
+            status="healthy",
+        )
+        self.db.upsert_system(
+            project_id="proj-beta",
+            name="ClickHouse Store",
+            slug="clickhouse-store",
+            health_score=90,
+            status="healthy",
+        )
+
+        # Verify get_portfolio_summary accurately reflects both targets
+        portfolio = self.db.get_portfolio_summary()
+        self.assertGreaterEqual(len(portfolio), 2)
+
+        alpha_item = next(item for item in portfolio if item["project"]["id"] == "proj-alpha")
+        beta_item = next(item for item in portfolio if item["project"]["id"] == "proj-beta")
+
+        self.assertEqual(alpha_item["metrics"]["total_systems"], 1)
+        self.assertEqual(alpha_item["metrics"]["open_findings"], 1)
+        self.assertEqual(alpha_item["metrics"]["severity_counts"]["critical"], 1)
+
+        self.assertEqual(beta_item["metrics"]["total_systems"], 2)
+        self.assertEqual(beta_item["metrics"]["open_findings"], 0)
+        self.assertGreaterEqual(beta_item["metrics"]["avg_health_score"], 90)
+
+        # Test REST /api/portfolio endpoint
+        h_port = MockRequestHandler(self.db, "GET", "/api/portfolio")
+        h_port.do_GET()
+        self.assertEqual(h_port.status_code, 200)
+        port_json = h_port.get_json()
+        self.assertIn("portfolio", port_json)
+        self.assertGreaterEqual(len(port_json["portfolio"]), 2)
+
+        # Test board isolation across target repositories
+        board_alpha = self.db.get_blackboard("proj-alpha")
+        self.assertEqual(board_alpha["project"]["id"], "proj-alpha")
+        self.assertEqual(len(board_alpha["matrix"]), 1)
+
+        board_beta = self.db.get_blackboard("proj-beta")
+        self.assertEqual(board_beta["project"]["id"], "proj-beta")
+        self.assertEqual(len(board_beta["matrix"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
