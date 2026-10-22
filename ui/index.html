@@ -12,7 +12,7 @@
     <div class="brand">
       <div class="brand-logo">A</div>
       <div>
-        <div class="brand-title">AuditOS <span class="brand-tag">Multi-Agent System Auditor</span></div>
+        <div class="brand-title">AuditOS <span class="brand-tag">Kernel v2</span></div>
         <div class="brand-sub" id="projectRootLabel">Loading project...</div>
       </div>
     </div>
@@ -21,19 +21,19 @@
       <div class="control-group">
         <label for="projectSelect">Project</label>
         <select id="projectSelect" title="Select Active Project"></select>
-        <button class="btn btn-sm btn-ghost" id="btnNewProject" title="Create New Project">+ Project</button>
+        <button class="btn btn-xs btn-ghost" id="btnNewProject" title="Create New Project">+ New</button>
       </div>
 
       <div class="control-group">
         <label for="activeAgentSelect">Acting Agent</label>
         <select id="activeAgentSelect" title="Identity used when claiming tasks or logging findings in UI"></select>
-        <button class="btn btn-sm btn-ghost" id="btnRegisterAgent" title="Register New Worker Agent">+ Agent</button>
+        <button class="btn btn-xs btn-ghost" id="btnRegisterAgent" title="Register New Worker Agent">+ Register</button>
       </div>
 
       <div class="action-buttons">
-        <button class="btn btn-sm" id="btnRefresh" title="Refresh live state">↻ Refresh</button>
-        <button class="btn btn-sm btn-accent" id="btnExportMd" title="Download Markdown Report">↓ Export Report</button>
-        <button class="btn btn-sm btn-secondary" id="btnSeedDemo" title="Load sample multi-system codebase audit">⚡ Load Demo Data</button>
+        <button class="btn btn-sm btn-ghost" id="btnRefresh" title="Refresh live state">↻ Sync</button>
+        <button class="btn btn-sm btn-primary" id="btnExportMd" title="Download Markdown Report">↓ Export Report</button>
+        <button class="btn btn-sm btn-secondary" id="btnSeedDemo" title="Load sample multi-system codebase audit">⚡ Load Demo</button>
       </div>
     </div>
   </header>
@@ -41,32 +41,50 @@
   <!-- Telemetry Metric Strip -->
   <section class="metrics-strip" id="metricsStrip">
     <div class="metric-card">
-      <div class="metric-label">Systems & Subsystems</div>
+      <div class="metric-label">
+        <span>Architecture Scope</span>
+        <span style="font-size:12px;opacity:0.6">📦</span>
+      </div>
       <div class="metric-value" id="metricSystems">0 / 0</div>
       <div class="metric-foot" id="metricCoverage">0% reviewed</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">System Interactions</div>
+      <div class="metric-label">
+        <span>System Interactions</span>
+        <span style="font-size:12px;opacity:0.6">🔗</span>
+      </div>
       <div class="metric-value" id="metricRelations">0</div>
       <div class="metric-foot">Cross-system contracts</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">Avg System Health</div>
+      <div class="metric-label">
+        <span>Avg System Health</span>
+        <span style="font-size:12px;opacity:0.6">🛡️</span>
+      </div>
       <div class="metric-value" id="metricHealth">—</div>
       <div class="metric-foot" id="metricHealthSub">Across scored components</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">Agent Workforce</div>
+      <div class="metric-label">
+        <span>Agent Workforce</span>
+        <span style="font-size:12px;opacity:0.6">👥</span>
+      </div>
       <div class="metric-value" id="metricAgents">0</div>
       <div class="metric-foot" id="metricAgentsSub">0 active workers</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">Audit Task Queue</div>
+      <div class="metric-label">
+        <span>Audit Task Queue</span>
+        <span style="font-size:12px;opacity:0.6">📋</span>
+      </div>
       <div class="metric-value" id="metricTasks">0 / 0</div>
       <div class="metric-foot" id="metricTasksSub">0 open · 0 claimed</div>
     </div>
     <div class="metric-card">
-      <div class="metric-label">Audit Findings</div>
+      <div class="metric-label">
+        <span>Audit Findings</span>
+        <span style="font-size:12px;opacity:0.6">⚠️</span>
+      </div>
       <div class="metric-value" id="metricFindings">0</div>
       <div class="metric-foot" id="metricFindingsSub">0 critical · 0 high</div>
     </div>
@@ -74,23 +92,23 @@
 
   <!-- Main Navigation Tabs -->
   <nav class="nav-tabs">
-    <button class="tab-btn" data-tab="portfolio">
-      📁 Target Repos Portfolio
-    </button>
     <button class="tab-btn active" data-tab="systems">
-      1. Systems & Subsystems Explorer
+      <span>📦</span> Systems Explorer
     </button>
     <button class="tab-btn" data-tab="topology">
-      2. Cross-System Topology ("Works With")
+      <span>🕸️</span> Cross-System Topology
     </button>
     <button class="tab-btn" data-tab="workforce">
-      3. Multi-Agent Workforce & Tasks
+      <span>👥</span> Agent Workforce & Tasks
     </button>
     <button class="tab-btn" data-tab="findings">
-      4. Findings & Review Ledger
+      <span>🛡️</span> Findings & Review Ledger
     </button>
     <button class="tab-btn" data-tab="logs">
-      5. Timestamped Audit Trail
+      <span>📜</span> Timestamped Audit Trail
+    </button>
+    <button class="tab-btn" data-tab="portfolio">
+      <span>📁</span> Target Repositories
     </button>
   </nav>
 

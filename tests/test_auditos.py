@@ -719,6 +719,95 @@ class TestAuditOSRemediation(unittest.TestCase):
         self.assertEqual(board_beta["project"]["id"], "proj-beta")
         self.assertEqual(len(board_beta["matrix"]), 2)
 
+    def test_sweep_governor_high_finding_and_lease_cleaner(self) -> None:
+        """Verify sweep auto-fix cannot paint high-finding systems healthy, clears agent pointers, and matches span_hash."""
+        pid = self.db.resolve_project_id()
+
+        # 1. Create a system with asserted health 90 in progress
+        sys_obj = self.db.upsert_system(
+            project_id=pid,
+            name="Payment Settlement Core",
+            slug="payment-settlement-core",
+            health_score=90,
+            status="in_progress",
+        )
+        sid = sys_obj["id"]
+
+        # Complete a task so it qualifies for milestone sign-off (has_completed=True, has_pending=False)
+        task = self.db.create_task(
+            project_id=pid,
+            title="Initial audit of settlement",
+            system_ref=sid,
+            claim_immediately_for="agent-01",
+        )
+        self.db.complete_task(task_id=task["id"], agent_id="agent-01")
+
+        # 2. Add an open HIGH severity finding on this system with code snippet for span_hash
+        f1 = self.db.add_finding(
+            project_id=pid,
+            title="Unchecked float precision in ledger rounding",
+            severity="high",
+            category="performance",
+            system_ref=sid,
+            file_path="src/ledger/round.py",
+            line_range="10-25",
+            code_snippet="def round_amount(x): return float(x)",
+            recommendation="Use decimal.Decimal for all monetary calculations.",
+        )
+        self.assertTrue(len(f1["span_hash"]) > 0)
+
+        # 3. Setup a zombie task and system claimed by agent-zombie
+        zombie_agent = self.db.register_agent(agent_id="agent-zombie", name="Zombie Agent", project_id=pid)
+        z_task = self.db.create_task(
+            project_id=pid,
+            title="Stalled reconciliation task",
+            system_ref=sid,
+            claim_immediately_for="agent-zombie",
+        )
+        # Manually expire the lease in the past for both task and system
+        past_iso = "2020-01-01T00:00:00.000Z"
+        with self.db.connect(immediate=True) as conn:
+            conn.execute("UPDATE tasks SET lease_until = ? WHERE id = ?", (past_iso, z_task["id"]))
+            conn.execute("UPDATE systems SET lease_until = ? WHERE id = ?", (past_iso, sid))
+            conn.execute("UPDATE agents SET current_task_id = ?, current_system_id = ? WHERE id = ?", (z_task["id"], sid, "agent-zombie"))
+
+        # Add a duplicate finding with identical span_hash
+        f2 = self.db.add_finding(
+            project_id=pid,
+            title="Another finding with exact same snippet",
+            severity="high",
+            category="performance",
+            system_ref=sid,
+            file_path="src/ledger/different_file.py",
+            line_range="100-115",
+            code_snippet="def round_amount(x): return float(x)",  # same snippet -> same span_hash
+        )
+        self.assertEqual(f1["span_hash"], f2["span_hash"])
+
+        # 4. Run sweep with auto_fix=True and agent_id=None
+        sweep_res = self.db.run_sweep(pid, auto_fix=True, agent_id=None)
+
+        # Verify duplicate detected via span_hash
+        self.assertGreaterEqual(len(sweep_res["duplicates"]), 1)
+        dup_entry = next((d for d in sweep_res["duplicates"] if d["span_hash"] == f1["span_hash"]), None)
+        self.assertIsNotNone(dup_entry)
+        self.assertIn("span_hash", dup_entry["reason"])
+
+        # 5. INVARIANT: System CANNOT be painted healthy! Status MUST be needs_attention, health clamped <= 75
+        updated_sys = self.db.get_system(pid, sid)
+        self.assertEqual(updated_sys["status"], "needs_attention")
+        self.assertLessEqual(updated_sys["health_score"], 75)
+
+        # 6. INVARIANT: Zombie repair must clear agents' current_task_id and current_system_id
+        with self.db.connect() as conn:
+            z_row = conn.execute("SELECT current_task_id, current_system_id FROM agents WHERE id = ?", ("agent-zombie",)).fetchone()
+            self.assertIsNone(z_row["current_task_id"])
+            self.assertIsNone(z_row["current_system_id"])
+
+            # 7. INVARIANT: Sweep did NOT auto-insert an 'audit-lead' agent when agent_id was None
+            lead_agent = conn.execute("SELECT id FROM agents WHERE id = 'audit-lead'").fetchone()
+            self.assertIsNone(lead_agent)
+
 
 if __name__ == "__main__":
     unittest.main()

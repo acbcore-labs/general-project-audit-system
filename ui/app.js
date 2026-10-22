@@ -1,4 +1,4 @@
-/* AuditOS Frontend Application */
+/* AuditOS Frontend Application — Masterful UI/UX Devtools Engine */
 const state = {
   snapshot: null,
   activeProjectId: null,
@@ -7,6 +7,8 @@ const state = {
   activeTab: "systems",
   modalSubmitHandler: null,
   lastDossier: null,
+  dossierTab: "overview",
+  collapsedSystems: new Set(),
 };
 
 function esc(str) {
@@ -168,7 +170,15 @@ function renderMetrics() {
 
 function statusBadge(status) {
   const s = (status || "unreviewed").toLowerCase();
-  return `<span class="badge badge-${esc(s)}">${esc(s)}</span>`;
+  const labels = {
+    reviewed: "Reviewed",
+    healthy: "Healthy",
+    needs_attention: "Needs Attention",
+    in_progress: "In Progress",
+    unreviewed: "Unreviewed",
+  };
+  const label = labels[s] || s;
+  return `<span class="badge badge-${esc(s)}">${esc(label)}</span>`;
 }
 
 function severityBadge(sev) {
@@ -178,11 +188,11 @@ function severityBadge(sev) {
 
 function healthBadge(score) {
   if (score === null || score === undefined || score === "") {
-    return `<span class="badge">unscored</span>`;
+    return `<span class="health-badge" style="background:var(--bg-elevated);color:var(--text-dim);border:1px solid var(--border-subtle)">—</span>`;
   }
   const n = Number(score);
-  const cls = n >= 85 ? "badge-healthy" : n >= 70 ? "badge-medium" : "badge-critical";
-  return `<span class="badge ${cls}">${n}/100</span>`;
+  const cls = n >= 85 ? "health-high" : n >= 70 ? "health-med" : "health-low";
+  return `<span class="health-badge ${cls}">${n}/100</span>`;
 }
 
 /* =========================================================================
@@ -355,27 +365,34 @@ function renderSystemsExplorer() {
     if (!selfMatch && !childMatches) return;
 
     const isSelected = sys.id === state.selectedSystemId;
+    const isCollapsed = state.collapsedSystems ? state.collapsedSystems.has(sys.id) : false;
+    const hasChildren = children.length > 0;
+
     const claimPill = sys.claimed_by
-      ? `<span class="badge badge-claimed" title="Claimed until ${esc(sys.lease_until)}">🔒 @${esc(sys.claimed_by)}</span>`
+      ? `<span class="badge badge-claimed" style="font-size:10px;padding:1px 5px" title="Claimed until ${esc(sys.lease_until)}">🔒 @${esc(sys.claimed_by)}</span>`
       : "";
     const findingsPill =
       sys.open_findings_count > 0
-        ? `<span class="badge ${sys.high_findings_count > 0 ? "badge-critical" : "badge-medium"}">${sys.open_findings_count} findings</span>`
+        ? `<span class="badge ${sys.high_findings_count > 0 ? "badge-critical" : "badge-medium"}" style="font-size:10px;padding:1px 5px">${sys.open_findings_count} finding${sys.open_findings_count > 1 ? "s" : ""}</span>`
         : "";
+
+    const expanderBtn = hasChildren
+      ? `<span class="tree-expander" data-action="toggle-system-collapse" data-id="${esc(sys.id)}" style="cursor:pointer;padding:0 4px;color:var(--text-dim);font-size:10px;user-select:none" title="${isCollapsed ? 'Expand children' : 'Collapse children'}">${isCollapsed ? '▶' : '▼'}</span>`
+      : `<span style="display:inline-block;width:16px"></span>`;
 
     html.push(`
       <div class="tree-node ${depth > 0 ? "child-node" : ""} ${isSelected ? "selected" : ""}"
-           style="margin-left: ${depth * 16}px"
            data-action="select-system" data-id="${esc(sys.id)}">
         <div class="tree-node-top">
           <div class="tree-node-title">
-            <span>${depth === 0 ? "📦" : "↳"}</span>
+            ${expanderBtn}
+            <span class="node-icon">${depth === 0 ? "📦" : "↳"}</span>
             <span>${esc(sys.name)}</span>
           </div>
           ${healthBadge(sys.health_score)}
         </div>
-        <div class="tree-node-meta">
-          <span style="font-family:var(--font-mono)">${esc(sys.slug)}</span>
+        <div class="tree-node-meta" style="${depth > 0 ? 'padding-left:18px' : 'padding-left:16px'}">
+          <span class="slug-label">${esc(sys.slug)}</span>
           <span>·</span>
           <span>${esc(sys.system_type)}</span>
           ${statusBadge(sys.status)}
@@ -385,11 +402,13 @@ function renderSystemsExplorer() {
       </div>
     `);
 
-    children.forEach((child) => renderNode(child, depth + 1));
+    if (!isCollapsed) {
+      children.forEach((child) => renderNode(child, depth + 1));
+    }
   }
 
   (byParent["ROOT"] || []).forEach((rootSys) => renderNode(rootSys, 0));
-  treeContainer.innerHTML = html.join("") || `<div class="empty-state">No matching systems.</div>`;
+  treeContainer.innerHTML = html.join("") || `<div class="empty-state">No matching systems found.</div>`;
 
   if (state.selectedSystemId) {
     loadAndRenderDossier(state.selectedSystemId);
@@ -432,10 +451,11 @@ async function loadAndRenderDossier(systemId) {
     }
     state.lastDossier = s;
     const isClaimed = Boolean(s.claimed_by);
+    const curTab = state.dossierTab || "overview";
 
     const subsystemsHtml =
       s.subsystems.length === 0
-        ? `<div style="color:var(--text-dim);font-size:12.5px">No child subsystems registered under this component.</div>`
+        ? `<div style="color:var(--text-dim);font-size:12.5px;padding:8px 0">No child subsystems registered under this component.</div>`
         : `<div class="rel-grid">
             ${s.subsystems
               .map(
@@ -443,9 +463,9 @@ async function loadAndRenderDossier(systemId) {
               <div class="rel-card" style="cursor:pointer" data-action="select-system" data-id="${esc(sub.id)}">
                 <div class="rel-card-top">
                   <strong>↳ ${esc(sub.name)} <span style="font-family:var(--font-mono);font-weight:400;color:var(--text-muted)">(${esc(sub.slug)})</span></strong>
-                  <div style="display:flex;gap:6px">${statusBadge(sub.status)} ${healthBadge(sub.health_score)}</div>
+                  <div style="display:flex;gap:6px;align-items:center">${statusBadge(sub.status)} ${healthBadge(sub.health_score)}</div>
                 </div>
-                <div style="font-size:12px;color:var(--text-muted)">${esc(sub.description || "No description")}</div>
+                <div style="font-size:12px;color:var(--text-muted)">${esc(sub.description || "No description provided")}</div>
                 <div style="font-size:11px;font-family:var(--font-mono);color:var(--text-dim)">Scope: ${esc(sub.path_scope || "—")} · Updated: ${esc(fmtTime(sub.updated_at))}</div>
               </div>
             `
@@ -455,7 +475,7 @@ async function loadAndRenderDossier(systemId) {
 
     const outboundHtml =
       s.outbound_relations.length === 0
-        ? `<div style="color:var(--text-dim);font-size:12.5px">No outbound dependencies recorded.</div>`
+        ? `<div style="color:var(--text-dim);font-size:12.5px;padding:6px 0">No outbound dependencies recorded.</div>`
         : s.outbound_relations
             .map(
               (r) => `
@@ -468,8 +488,8 @@ async function loadAndRenderDossier(systemId) {
                 </span>
                 ${severityBadge(r.criticality)}
               </div>
-              <div style="font-size:11.5px;font-family:var(--font-mono);color:var(--accent)">Interface/Protocol: ${esc(r.interface_or_protocol || "Direct")}</div>
-              <div style="font-size:12.5px">${esc(r.description)}</div>
+              <div style="font-size:11.5px;font-family:var(--font-mono);color:var(--accent-light)">Interface/Protocol: ${esc(r.interface_or_protocol || "Direct")}</div>
+              <div style="font-size:12.5px;color:var(--text-secondary)">${esc(r.description)}</div>
               ${r.details ? `<div style="font-size:11.5px;color:var(--text-muted)">${esc(r.details)}</div>` : ""}
               <div style="font-size:11px;color:var(--text-dim)">Recorded by ${esc(r.recorded_by || "system")} · ${esc(fmtTime(r.updated_at))}</div>
             </div>
@@ -479,7 +499,7 @@ async function loadAndRenderDossier(systemId) {
 
     const inboundHtml =
       s.inbound_relations.length === 0
-        ? `<div style="color:var(--text-dim);font-size:12.5px">No inbound callers/dependents recorded.</div>`
+        ? `<div style="color:var(--text-dim);font-size:12.5px;padding:6px 0">No inbound callers or dependents recorded.</div>`
         : s.inbound_relations
             .map(
               (r) => `
@@ -492,8 +512,8 @@ async function loadAndRenderDossier(systemId) {
                 </span>
                 ${severityBadge(r.criticality)}
               </div>
-              <div style="font-size:11.5px;font-family:var(--font-mono);color:var(--accent)">Interface/Protocol: ${esc(r.interface_or_protocol || "Direct")}</div>
-              <div style="font-size:12.5px">${esc(r.description)}</div>
+              <div style="font-size:11.5px;font-family:var(--font-mono);color:var(--accent-light)">Interface/Protocol: ${esc(r.interface_or_protocol || "Direct")}</div>
+              <div style="font-size:12.5px;color:var(--text-secondary)">${esc(r.description)}</div>
               ${r.details ? `<div style="font-size:11.5px;color:var(--text-muted)">${esc(r.details)}</div>` : ""}
               <div style="font-size:11px;color:var(--text-dim)">Recorded by ${esc(r.recorded_by || "system")} · ${esc(fmtTime(r.updated_at))}</div>
             </div>
@@ -503,30 +523,205 @@ async function loadAndRenderDossier(systemId) {
 
     const findingsHtml =
       s.findings.length === 0
-        ? `<div style="color:var(--text-dim);font-size:12.5px">No findings logged for this system.</div>`
+        ? `<div style="color:var(--text-dim);font-size:12.5px;padding:8px 0">No open findings logged for this system.</div>`
         : s.findings
             .map(
               (f) => `
-            <div class="rel-card">
-              <div class="rel-card-top">
-                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <div class="finding-card">
+              <div class="finding-card-top">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                   ${severityBadge(f.severity)}
                   <span class="badge">${esc(f.category)}</span>
-                  <strong>${esc(f.title)}</strong>
+                  <span class="finding-title">${esc(f.title)}</span>
                 </div>
-                ${statusBadge(f.status)}
+                <div style="display:flex;align-items:center;gap:8px">
+                  ${statusBadge(f.status)}
+                  <select data-action="update-finding-status" data-id="${esc(f.id)}" style="padding:2px 8px;font-size:11px">
+                    <option value="open" ${f.status === 'open' ? 'selected' : ''}>Open</option>
+                    <option value="confirmed" ${f.status === 'confirmed' ? 'selected' : ''}>Confirmed</option>
+                    <option value="mitigated" ${f.status === 'mitigated' ? 'selected' : ''}>Mitigated</option>
+                    <option value="resolved" ${f.status === 'resolved' ? 'selected' : ''}>Resolved</option>
+                    <option value="wont_fix" ${f.status === 'wont_fix' ? 'selected' : ''}>Won't Fix</option>
+                  </select>
+                </div>
               </div>
-              ${f.file_path ? `<div class="finding-loc">${esc(f.file_path)}${f.line_range ? ":" + esc(f.line_range) : ""}</div>` : ""}
-              <div style="font-size:12.5px">${esc(f.description)}</div>
+              ${
+                f.file_path
+                  ? `
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                  <span class="finding-loc">${esc(f.file_path)}${f.line_range ? ":" + esc(f.line_range) : ""}</span>
+                  ${f.commit_sha ? `<span class="badge" style="font-family:var(--font-mono);font-size:10.5px">commit <code>${esc(f.commit_sha.slice(0, 8))}</code></span>` : ""}
+                  ${f.span_hash ? `<span class="badge" style="font-family:var(--font-mono);font-size:10.5px" title="Evidence snippet SHA256">span <code>${esc(f.span_hash.slice(0, 8))}</code></span>` : ""}
+                </div>
+              `
+                  : ""
+              }
+              <div style="font-size:12.5px;color:var(--text-secondary)">${esc(f.description)}</div>
               ${f.details ? `<div style="font-size:12px;color:var(--text-muted)"><strong>Details:</strong> ${esc(f.details)}</div>` : ""}
-              ${f.recommendation ? `<div style="font-size:12px;color:#6ee7b7"><strong>Recommendation:</strong> ${esc(f.recommendation)}</div>` : ""}
+              ${f.recommendation ? `<div class="finding-rec-box"><strong>💡 Recommendation:</strong> ${esc(f.recommendation)}</div>` : ""}
               <div style="font-size:11px;color:var(--text-dim)">Logged by @${esc(f.agent_id || "unknown")} · ${esc(fmtTime(f.created_at))}</div>
             </div>
           `
             )
             .join("");
 
+    const tasksHtml =
+      s.tasks.length === 0
+        ? `<div style="color:var(--text-dim);font-size:12.5px;padding:8px 0">No audit tasks currently queued for this component.</div>`
+        : `<div class="rel-grid">
+            ${s.tasks
+              .map(
+                (t) => `
+              <div class="rel-card">
+                <div class="rel-card-top">
+                  <strong style="font-size:12.5px">${esc(t.title)}</strong>
+                  <div style="display:flex;gap:6px;align-items:center">
+                    ${severityBadge(t.priority)}
+                    ${statusBadge(t.status)}
+                  </div>
+                </div>
+                <div style="font-size:12px;color:var(--text-muted)">${esc(t.description || "Standard audit review task")}</div>
+                <div style="font-size:11px;font-family:var(--font-mono);color:var(--text-dim)">
+                  Type: ${esc(t.task_type)} · Claimed: ${t.claimed_by ? "@" + esc(t.claimed_by) : "Unassigned"}
+                </div>
+                <div style="display:flex;gap:6px;margin-top:4px">
+                  ${
+                    t.status === "open"
+                      ? `<button class="btn btn-xs btn-primary" data-action="claim-task" data-id="${esc(t.id)}">🔒 Claim Task</button>`
+                      : t.status === "claimed"
+                      ? `<button class="btn btn-xs btn-accent" data-action="complete-task" data-id="${esc(t.id)}">✓ Complete</button>`
+                      : `<span style="font-size:11px;color:var(--healthy);font-weight:600">✓ Completed</span>`
+                  }
+                </div>
+              </div>
+            `
+              )
+              .join("")}
+          </div>`;
+
+    // Sections definitions
+    const overviewSection = `
+      <div class="dossier-section">
+        <div class="meta-grid">
+          <div class="meta-item">
+            <span class="meta-label">Component ID</span>
+            <div style="display:flex;align-items:center;gap:6px">
+              <span class="meta-val">${esc(s.id)}</span>
+              <button class="btn btn-xs btn-ghost" data-action="copy-text" data-text="${esc(s.id)}" title="Copy Component ID">📋</button>
+            </div>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Parent System</span>
+            <span class="meta-val">${
+              s.parent
+                ? `<button class="link-btn" data-action="select-system" data-id="${esc(s.parent.id)}">${esc(s.parent.name)} (${esc(s.parent.slug)})</button>`
+                : "Top-Level Root System"
+            }</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Codebase Path Scope</span>
+            <div style="display:flex;align-items:center;gap:6px">
+              <span class="meta-val">${esc(s.path_scope || "—")}</span>
+              ${s.path_scope ? `<button class="btn btn-xs btn-ghost" data-action="copy-text" data-text="${esc(s.path_scope)}" title="Copy Path Scope">📋</button>` : ""}
+            </div>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Active Agent Lock</span>
+            <span class="meta-val">${s.claimed_by ? `@${esc(s.claimed_by)} (until ${esc(fmtTime(s.lease_until))})` : "Unclaimed"}</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Last Audited By</span>
+            <span class="meta-val">${esc(s.last_audited_by || "—")} (${esc(fmtTime(s.last_audited_at))})</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Created / Updated</span>
+            <span class="meta-val">${esc(fmtTime(s.created_at))}<br/>${esc(fmtTime(s.updated_at))}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="dossier-section">
+        <div class="dossier-section-header">
+          <h4>Architectural Details, Invariants & Review Notes</h4>
+        </div>
+        <div class="details-box">${esc(s.details || "No detailed architectural notes recorded yet. Click 'Edit Specs' or release a claim with review notes.")}</div>
+      </div>
+    `;
+
+    const subsystemsSection = `
+      <div class="dossier-section">
+        <div class="dossier-section-header">
+          <h4>Child Subsystems (${s.subsystems.length})</h4>
+          <button class="btn btn-xs btn-ghost" data-action="add-subsystem" data-id="${esc(s.id)}">+ New Subsystem</button>
+        </div>
+        ${subsystemsHtml}
+      </div>
+    `;
+
+    const relationsSection = `
+      <div class="dossier-section">
+        <div class="dossier-section-header">
+          <h4>Cross-System Interactions — How "${esc(s.name)}" Works With Other Systems</h4>
+          <button class="btn btn-xs btn-ghost" data-action="add-relation" data-slug="${esc(s.slug)}">+ Add Interaction</button>
+        </div>
+        <div class="rel-grid">
+          <div>
+            <div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px">OUTBOUND (Calls / Depends On / Publishes To) — ${s.outbound_relations.length}</div>
+            <div style="display:flex;flex-direction:column;gap:8px">${outboundHtml}</div>
+          </div>
+          <div>
+            <div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px">INBOUND (Used By / Consumed By) — ${s.inbound_relations.length}</div>
+            <div style="display:flex;flex-direction:column;gap:8px">${inboundHtml}</div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const findingsSection = `
+      <div class="dossier-section">
+        <div class="dossier-section-header">
+          <h4>Audit Findings & Defects (${s.findings.length})</h4>
+          <button class="btn btn-xs btn-danger" data-action="add-finding" data-slug="${esc(s.slug)}">+ Log Finding</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px">${findingsHtml}</div>
+      </div>
+    `;
+
+    const tasksSection = `
+      <div class="dossier-section">
+        <div class="dossier-section-header">
+          <h4>Scoped Audit Tasks (${s.tasks.length})</h4>
+          <button class="btn btn-xs btn-ghost" data-action="add-task">+ Create Task</button>
+        </div>
+        ${tasksHtml}
+      </div>
+    `;
+
+    let activeContent = "";
+    if (curTab === "overview") {
+      activeContent = overviewSection;
+    } else if (curTab === "subsystems") {
+      activeContent = subsystemsSection;
+    } else if (curTab === "relations") {
+      activeContent = relationsSection;
+    } else if (curTab === "findings") {
+      activeContent = findingsSection;
+    } else if (curTab === "tasks") {
+      activeContent = tasksSection;
+    } else {
+      // "all"
+      activeContent = overviewSection + subsystemsSection + relationsSection + findingsSection + tasksSection;
+    }
+
     pane.innerHTML = `
+      <div class="dossier-breadcrumbs">
+        <span>Projects</span>
+        <span>/</span>
+        <span>${esc(state.snapshot.project.name)}</span>
+        <span>/</span>
+        <span style="color:var(--text-main)">${esc(s.name)}</span>
+      </div>
+
       <div class="dossier-header">
         <div>
           <div class="dossier-title-row">
@@ -536,92 +731,45 @@ async function loadAndRenderDossier(systemId) {
             ${statusBadge(s.status)}
             ${healthBadge(s.health_score)}
           </div>
-          <div style="font-size:13px;color:var(--text-muted);margin-top:4px">${esc(s.description || "No summary description provided.")}</div>
+          <div class="dossier-desc">${esc(s.description || "No architectural description recorded for this component.")}</div>
         </div>
 
         <div class="dossier-actions">
           ${
             isClaimed
               ? `<button class="btn btn-sm btn-secondary" data-action="release-system" data-id="${esc(s.id)}">🔓 Release Claim (@${esc(s.claimed_by)})</button>`
-              : `<button class="btn btn-sm btn-secondary" data-action="claim-system" data-id="${esc(s.id)}">🔒 Claim for @${esc(state.activeAgentId || "agent")}</button>`
+              : `<button class="btn btn-sm btn-primary" data-action="claim-system" data-id="${esc(s.id)}">🔒 Claim System</button>`
           }
-          <button class="btn btn-sm" data-action="edit-system" data-id="${esc(s.id)}">✎ Edit Details</button>
-          <button class="btn btn-sm btn-primary" data-action="add-subsystem" data-id="${esc(s.id)}">+ Add Subsystem</button>
-          <button class="btn btn-sm btn-accent" data-action="add-relation" data-slug="${esc(s.slug)}">+ Link Interaction</button>
+          <button class="btn btn-sm" data-action="edit-system" data-id="${esc(s.id)}">✎ Edit Specs</button>
+          <button class="btn btn-sm" data-action="add-subsystem" data-id="${esc(s.id)}">+ Subsystem</button>
+          <button class="btn btn-sm" data-action="add-relation" data-slug="${esc(s.slug)}">+ Contract Link</button>
           <button class="btn btn-sm btn-danger" data-action="add-finding" data-slug="${esc(s.slug)}">+ Log Finding</button>
         </div>
       </div>
 
-      <div class="meta-grid">
-        <div class="meta-item">
-          <span class="meta-label">Component ID</span>
-          <span class="meta-val">${esc(s.id)}</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-label">Parent System</span>
-          <span class="meta-val">${
-            s.parent
-              ? `<button class="link-btn" data-action="select-system" data-id="${esc(s.parent.id)}">${esc(s.parent.name)} (${esc(s.parent.slug)})</button>`
-              : "Top-Level Root System"
-          }</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-label">Codebase Path Scope</span>
-          <span class="meta-val">${esc(s.path_scope || "—")}</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-label">Active Agent Lock</span>
-          <span class="meta-val">${s.claimed_by ? `@${esc(s.claimed_by)} (until ${esc(fmtTime(s.lease_until))})` : "Unclaimed"}</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-label">Last Audited By</span>
-          <span class="meta-val">${esc(s.last_audited_by || "—")} (${esc(fmtTime(s.last_audited_at))})</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-label">Created / Updated</span>
-          <span class="meta-val">${esc(fmtTime(s.created_at))}<br/>${esc(fmtTime(s.updated_at))}</span>
-        </div>
+      <!-- Dossier Multi-Section Navigation Bar -->
+      <div class="dossier-nav">
+        <button class="dossier-nav-btn ${curTab === 'overview' ? 'active' : ''}" data-action="switch-dossier-tab" data-tab="overview">
+          📋 Specs & Invariants
+        </button>
+        <button class="dossier-nav-btn ${curTab === 'subsystems' ? 'active' : ''}" data-action="switch-dossier-tab" data-tab="subsystems">
+          ↳ Subsystems <span class="tab-badge">${s.subsystems.length}</span>
+        </button>
+        <button class="dossier-nav-btn ${curTab === 'relations' ? 'active' : ''}" data-action="switch-dossier-tab" data-tab="relations">
+          🔗 Interactions <span class="tab-badge">${s.outbound_relations.length + s.inbound_relations.length}</span>
+        </button>
+        <button class="dossier-nav-btn ${curTab === 'findings' ? 'active' : ''}" data-action="switch-dossier-tab" data-tab="findings">
+          🛡️ Findings <span class="tab-badge ${s.findings.length > 0 ? 'tab-badge-danger' : ''}">${s.findings.length}</span>
+        </button>
+        <button class="dossier-nav-btn ${curTab === 'tasks' ? 'active' : ''}" data-action="switch-dossier-tab" data-tab="tasks">
+          ⚡ Tasks <span class="tab-badge">${s.tasks.length}</span>
+        </button>
+        <button class="dossier-nav-btn ${curTab === 'all' ? 'active' : ''}" data-action="switch-dossier-tab" data-tab="all" style="margin-left:auto">
+          👁️ View All Sections
+        </button>
       </div>
 
-      <div class="dossier-section">
-        <div class="dossier-section-header">
-          <h4>Architectural Details, Invariants & Review Notes</h4>
-        </div>
-        <div class="details-box">${esc(s.details || "No detailed architectural notes recorded yet. Click 'Edit Details' or release a claim with review notes.")}</div>
-      </div>
-
-      <div class="dossier-section">
-        <div class="dossier-section-header">
-          <h4>Child Subsystems (${s.subsystems.length})</h4>
-          <button class="btn btn-xs btn-ghost" data-action="add-subsystem" data-id="${esc(s.id)}">+ New Subsystem</button>
-        </div>
-        ${subsystemsHtml}
-      </div>
-
-      <div class="dossier-section">
-        <div class="dossier-section-header">
-          <h4>Cross-System Interactions — How "${esc(s.name)}" Works With Other Systems</h4>
-          <button class="btn btn-xs btn-ghost" data-action="add-relation" data-slug="${esc(s.slug)}">+ Add Interaction</button>
-        </div>
-        <div class="rel-grid">
-          <div>
-            <div style="font-size:11.5px;font-weight:700;color:var(--text-muted);margin-bottom:6px">OUTBOUND (Calls / Depends On / Publishes To) — ${s.outbound_relations.length}</div>
-            <div style="display:flex;flex-direction:column;gap:8px">${outboundHtml}</div>
-          </div>
-          <div>
-            <div style="font-size:11.5px;font-weight:700;color:var(--text-muted);margin-bottom:6px">INBOUND (Used By / Consumed By) — ${s.inbound_relations.length}</div>
-            <div style="display:flex;flex-direction:column;gap:8px">${inboundHtml}</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="dossier-section">
-        <div class="dossier-section-header">
-          <h4>Audit Findings (${s.findings.length})</h4>
-          <button class="btn btn-xs btn-ghost" data-action="add-finding" data-slug="${esc(s.slug)}">+ Log Finding</button>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:8px">${findingsHtml}</div>
-      </div>
+      ${activeContent}
     `;
   } catch (err) {
     pane.innerHTML = `<div class="empty-state">Could not load system dossier: ${esc(err.message)}</div>`;
@@ -1187,17 +1335,19 @@ function renderFindingsTab() {
               : ""
           }
           ${f.file_path ? `<span class="finding-loc">${esc(f.file_path)}${f.line_range ? ":" + esc(f.line_range) : ""}</span>` : ""}
+          ${f.commit_sha ? `<span class="badge" style="font-family:var(--font-mono);font-size:10.5px">commit <code>${esc(f.commit_sha.slice(0, 8))}</code></span>` : ""}
+          ${f.span_hash ? `<span class="badge" style="font-family:var(--font-mono);font-size:10.5px" title="Evidence snippet SHA256">span <code>${esc(f.span_hash.slice(0, 8))}</code></span>` : ""}
         </div>
 
-        <div style="font-size:13px">${esc(f.description)}</div>
+        <div style="font-size:13px;color:var(--text-secondary)">${esc(f.description)}</div>
         ${
           f.details
-            ? `<div style="background:var(--bg-base);padding:10px 12px;border-radius:6px;border:1px solid var(--border-subtle);font-size:12.5px;color:var(--text-muted)"><strong>Technical Details:</strong> ${esc(f.details)}</div>`
+            ? `<div style="background:var(--bg-base);padding:10px 14px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);font-size:12.5px;color:var(--text-muted)"><strong>Technical Details:</strong> ${esc(f.details)}</div>`
             : ""
         }
         ${
           f.recommendation
-            ? `<div style="background:rgba(16,185,129,0.08);padding:9px 12px;border-radius:6px;border:1px solid rgba(16,185,129,0.25);font-size:12.5px;color:#6ee7b7"><strong>Recommendation:</strong> ${esc(f.recommendation)}</div>`
+            ? `<div class="finding-rec-box"><strong>💡 Recommendation:</strong> ${esc(f.recommendation)}</div>`
             : ""
         }
 
@@ -1827,6 +1977,36 @@ document.addEventListener("DOMContentLoaded", () => {
         state.selectedSystemId = null;
         switchTab("systems");
         loadSnapshot(id);
+        break;
+      case "switch-dossier-tab":
+        state.dossierTab = target.dataset.tab;
+        if (state.selectedSystemId) {
+          loadAndRenderDossier(state.selectedSystemId);
+        }
+        break;
+      case "toggle-system-collapse":
+        e.stopPropagation();
+        const collapseId = target.dataset.id;
+        if (!state.collapsedSystems) state.collapsedSystems = new Set();
+        if (state.collapsedSystems.has(collapseId)) {
+          state.collapsedSystems.delete(collapseId);
+        } else {
+          state.collapsedSystems.add(collapseId);
+        }
+        renderSystemsExplorer();
+        break;
+      case "copy-text":
+        e.stopPropagation();
+        const copyVal = target.dataset.text;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(copyVal).then(() => {
+            showToast(`Copied to clipboard: ${copyVal}`);
+          }).catch(() => {
+            showToast(`Copied: ${copyVal}`);
+          });
+        } else {
+          showToast(`Copied: ${copyVal}`);
+        }
         break;
       case "export-portfolio-project":
         window.open(`/api/export/markdown?project=${encodeURIComponent(id)}`, "_blank");

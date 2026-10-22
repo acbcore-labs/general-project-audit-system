@@ -122,6 +122,7 @@ class SweepOrchestratorMixin:
                             "id": t["id"],
                             "title": t["title"],
                             "claimed_by": t.get("claimed_by"),
+                            "system_id": t.get("system_id"),
                             "lease_until": t.get("lease_until"),
                             "reason": "Offline agent" if is_offline else "Lease expired",
                         })
@@ -181,15 +182,27 @@ class SweepOrchestratorMixin:
                     is_same_file = f1.get("file_path") and f1.get("file_path") == f2.get("file_path")
                     is_same_lines = f1.get("line_range") and f1.get("line_range") == f2.get("line_range")
                     is_same_title = f1.get("title", "").strip().lower() == f2.get("title", "").strip().lower()
+                    is_same_span = bool(
+                        f1.get("span_hash")
+                        and f2.get("span_hash")
+                        and f1["span_hash"].strip()
+                        and f1["span_hash"].strip() == f2["span_hash"].strip()
+                    )
 
-                    if is_same_system and (is_same_title or (is_same_file and is_same_lines)):
+                    if is_same_span or (is_same_system and (is_same_title or (is_same_file and is_same_lines))):
                         seen_pairs.add(pair_key)
-                        reason = "Identical title on same system" if is_same_title else "Overlapping file and lines"
+                        if is_same_span:
+                            reason = f"Identical evidence span_hash fingerprint ({f1['span_hash'][:10]})"
+                        elif is_same_title:
+                            reason = "Identical title on same system"
+                        else:
+                            reason = "Overlapping file and lines on same system"
                         duplicates.append({
                             "finding_a": {"id": f1["id"], "title": f1["title"], "severity": f1["severity"]},
                             "finding_b": {"id": f2["id"], "title": f2["title"], "severity": f2["severity"]},
                             "file": f1.get("file_path") or "-",
                             "reason": reason,
+                            "span_hash": f1.get("span_hash") if is_same_span else None,
                         })
 
             # 4. Workforce & Coverage Imbalances
@@ -215,10 +228,11 @@ class SweepOrchestratorMixin:
                 has_completed = any(t["status"] == "completed" for t in sys_tasks)
                 has_pending = any(t["status"] in ("open", "claimed") for t in sys_tasks)
                 sys_findings = [f for f in findings if (f.get("system_id") == s["id"] or f.get("related_system_id") == s["id"]) and f["status"] == "open"]
-                has_crit = any(f["severity"] == "critical" for f in sys_findings)
 
                 if has_completed and not has_pending and s["status"] in ("unreviewed", "in_progress"):
-                    calibrated_status = "needs_attention" if has_crit else ("healthy" if (s.get("health_score") or 0) >= 85 else "reviewed")
+                    raw_target = "healthy" if (s.get("health_score") or 0) >= 85 else "reviewed"
+                    calibrated_status = self._compute_post_audit_system_status(conn, s["id"], s["status"], raw_target)
+                    calibrated_health = self._calibrate_system_health(conn, s["id"], s.get("health_score"))
                     ready_for_signoff.append({
                         "system_id": s["id"],
                         "slug": s["slug"],
@@ -226,6 +240,7 @@ class SweepOrchestratorMixin:
                         "current_status": s["status"],
                         "calibrated_status": calibrated_status,
                         "health_score": s.get("health_score"),
+                        "calibrated_health": calibrated_health,
                         "open_findings": len(sys_findings),
                     })
 
@@ -237,26 +252,56 @@ class SweepOrchestratorMixin:
                             "UPDATE tasks SET status = 'open', claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ? WHERE id = ?",
                             (now, z["id"]),
                         )
+                        conn.execute(
+                            "UPDATE agents SET current_task_id = NULL WHERE current_task_id = ?",
+                            (z["id"],),
+                        )
+                        if z.get("claimed_by") and z.get("system_id"):
+                            other_tasks = conn.execute(
+                                "SELECT COUNT(*) AS cnt FROM tasks WHERE system_id = ? AND claimed_by = ? AND status = 'claimed' AND id != ?",
+                                (z["system_id"], z["claimed_by"], z["id"]),
+                            ).fetchone()["cnt"]
+                            sys_hold = conn.execute(
+                                "SELECT COUNT(*) AS cnt FROM systems WHERE id = ? AND claimed_by = ? AND (lease_until IS NULL OR lease_until > ?)",
+                                (z["system_id"], z["claimed_by"], now),
+                            ).fetchone()["cnt"]
+                            if other_tasks == 0 and sys_hold == 0:
+                                conn.execute(
+                                    "UPDATE agents SET current_system_id = NULL WHERE id = ? AND current_system_id = ?",
+                                    (z["claimed_by"], z["system_id"]),
+                                )
                         actions_taken.append(f"Reopened stalled task '{z['title']}' ({z['id']})")
                     elif z["type"] == "system":
                         conn.execute(
                             "UPDATE systems SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ? WHERE id = ?",
                             (now, z["id"]),
                         )
+                        conn.execute(
+                            "UPDATE agents SET current_system_id = NULL WHERE current_system_id = ?",
+                            (z["id"],),
+                        )
                         actions_taken.append(f"Released stalled claim on system '{z['name']}' ({z['slug']})")
 
                 for s in ready_for_signoff:
-                    conn.execute(
-                        "UPDATE systems SET status = ?, updated_at = ? WHERE id = ?",
-                        (s["calibrated_status"], now, s["system_id"]),
+                    final_status = self._compute_post_audit_system_status(
+                        conn, s["system_id"], s["current_status"], s["calibrated_status"]
                     )
-                    actions_taken.append(f"Signed off system '{s['name']}' ({s['slug']}) -> {s['calibrated_status']}")
+                    final_health = self._calibrate_system_health(
+                        conn, s["system_id"], s["calibrated_health"]
+                    )
+                    conn.execute(
+                        "UPDATE systems SET status = ?, health_score = ?, updated_at = ? WHERE id = ?",
+                        (final_status, final_health, now, s["system_id"]),
+                    )
+                    actions_taken.append(
+                        f"Signed off system '{s['name']}' ({s['slug']}) -> {final_status} (health: {final_health})"
+                    )
 
                 if actions_taken:
                     self._log_event(
                         conn,
                         pid,
-                        agent_id or "audit-lead",
+                        agent_id,
                         "sweep.executed",
                         "project",
                         pid,
@@ -266,7 +311,7 @@ class SweepOrchestratorMixin:
 
             if unscaffolded:
                 for entry in unscaffolded:
-                    created = self.scaffold_system_tasks(pid, entry["slug"], created_by=agent_id or "audit-lead")
+                    created = self.scaffold_system_tasks(pid, entry["slug"], created_by=agent_id)
                     if created:
                         actions_taken.append(f"Scaffolded {len(created)} tasks for system '{entry['name']}'")
 
