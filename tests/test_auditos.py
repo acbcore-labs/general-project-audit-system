@@ -471,13 +471,13 @@ class TestAuditOSRemediation(unittest.TestCase):
         sys_obj1 = self.db.upsert_system(project_id=pid, name="Payment Core", slug="payment-core", system_type="service")
         sys_obj2 = self.db.upsert_system(project_id=pid, name="Auth Service", slug="auth-service", system_type="service")
 
-        # Auto-scaffold standard multi-disciplinary audit tasks
+        # Auto-scaffold standard multi-disciplinary audit tasks (5 disciplines including verification)
         scaffolded1 = self.db.scaffold_system_tasks(pid, "payment-core", created_by="arch-01")
-        self.assertEqual(len(scaffolded1), 4)
+        self.assertEqual(len(scaffolded1), 5)
         types = {t["task_type"] for t in scaffolded1}
-        self.assertEqual(types, {"architecture_map", "security_review", "performance_review", "integration_trace"})
+        self.assertEqual(types, {"architecture_map", "security_review", "performance_review", "integration_trace", "verification"})
 
-        scaffolded2 = self.db.scaffold_system_tasks(pid, "auth-service", created_by="arch-01")
+        scaffolded2 = self.db.scaffold_system_tasks(pid, "auth-service", created_by="arch-01", include_verification=False)
         self.assertEqual(len(scaffolded2), 4)
 
         # Role-aware dispatch: security-auditor should claim security_review
@@ -576,6 +576,69 @@ class TestAuditOSRemediation(unittest.TestCase):
         h_sweep.do_GET()
         self.assertEqual(h_sweep.status_code, 200)
         self.assertIn("zombies", h_sweep.get_json())
+
+    def test_evidence_provenance_and_health_calibration(self) -> None:
+        """Verify evidence reconstruction keys (commit_sha, span_hash) and health calibration limits."""
+        pid = self.db.resolve_project_id()
+
+        # Check PRAGMA user_version is 2
+        with self.db.connect() as conn:
+            ver = conn.execute("PRAGMA user_version;").fetchone()[0]
+            self.assertEqual(ver, 2)
+
+        # Create healthy system with health score 95
+        sys_obj = self.db.upsert_system(
+            project_id=pid,
+            name="Crypto Vault",
+            slug="crypto-vault",
+            health_score=95,
+            status="reviewed",
+        )
+        self.assertEqual(sys_obj["health_score"], 95)
+        self.assertEqual(sys_obj["status"], "reviewed")
+
+        # Log a critical finding with commit_sha and code_snippet
+        finding = self.db.add_finding(
+            project_id=pid,
+            title="Hardcoded master key in AES derivation",
+            severity="critical",
+            category="security",
+            system_ref="crypto-vault",
+            file_path="src/crypto/aes.py",
+            line_range="45-60",
+            commit_sha="a1b2c3d4e5f67890",
+            code_snippet="def derive(): return b'0123456789abcdef'",
+            recommendation="Read key from HSM or environment variable.",
+        )
+        self.assertEqual(finding["commit_sha"], "a1b2c3d4e5f67890")
+        self.assertTrue(len(finding["span_hash"]) > 0)
+
+        # Invariant check: system health must be clamped from 95 down to <= 65 and status forced to needs_attention
+        updated_sys = self.db.get_system(pid, "crypto-vault")
+        self.assertEqual(updated_sys["status"], "needs_attention")
+        self.assertLessEqual(updated_sys["health_score"], 65)
+
+        # Invariant check: complete_task attempting to assert health=99 on system with open critical finding is clamped
+        task = self.db.create_task(
+            project_id=pid,
+            title="Inspect key derivation",
+            system_ref="crypto-vault",
+            claim_immediately_for="agent-01",
+        )
+        self.db.complete_task(
+            task_id=task["id"],
+            agent_id="agent-01",
+            system_status="healthy",
+            system_health_score=99,
+        )
+        sys_after_task = self.db.get_system(pid, "crypto-vault")
+        self.assertEqual(sys_after_task["status"], "needs_attention")
+        self.assertLessEqual(sys_after_task["health_score"], 65)
+
+        # Markdown report check: ensure Reconstruction Key is exported
+        report = self.db.export_markdown_report(pid)
+        self.assertIn("Reconstruction Key", report)
+        self.assertIn("commit `a1b2c3d4`", report)
 
 
 if __name__ == "__main__":

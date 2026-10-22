@@ -545,6 +545,9 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
                     details=body.get("details", ""),
                     file_path=body.get("file_path", ""),
                     line_range=body.get("line_range", ""),
+                    commit_sha=body.get("commit_sha", ""),
+                    span_hash=body.get("span_hash", ""),
+                    code_snippet=body.get("code_snippet") or body.get("snippet", ""),
                     recommendation=body.get("recommendation", ""),
                     status=body.get("status", "open"),
                 )

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import subprocess
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -58,6 +60,33 @@ def validate_health_score(score: Optional[int]) -> Optional[int]:
     if val < 0 or val > 100:
         raise ValueError(f"health_score must be between 0 and 100 (got {val}).")
     return val
+
+
+def get_git_commit_sha(repo_path: Optional[str] = None) -> str:
+    """Attempt to detect the current HEAD git commit SHA for evidence provenance."""
+    try:
+        cmd = ["git", "rev-parse", "HEAD"]
+        cwd = repo_path if repo_path and os.path.isdir(repo_path) else None
+        res = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.5,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def compute_span_hash(code_snippet: Optional[str]) -> str:
+    """Compute a deterministic 16-character SHA-256 fingerprint of a code snippet or span."""
+    if not code_snippet or not str(code_snippet).strip():
+        return ""
+    return hashlib.sha256(str(code_snippet).strip().encode("utf-8")).hexdigest()[:16]
 
 
 VALID_PRIORITIES = ("critical", "high", "medium", "low")
@@ -255,6 +284,8 @@ CREATE TABLE IF NOT EXISTS findings (
     details TEXT DEFAULT '',
     file_path TEXT DEFAULT '',
     line_range TEXT DEFAULT '',
+    commit_sha TEXT DEFAULT '',
+    span_hash TEXT DEFAULT '',
     recommendation TEXT DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -402,6 +433,7 @@ class AuditDB:
             ).fetchone()
             if not existing:
                 conn.executescript(SCHEMA_SQL)
+                conn.execute("PRAGMA user_version = 2;")
                 conn.commit()
             else:
                 agent_cols = {r[1] for r in conn.execute("PRAGMA table_info(agents)").fetchall()}
@@ -448,6 +480,12 @@ class AuditDB:
                     conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_checkpoints_system ON agent_checkpoints(system_id);"
                     )
+                finding_cols = {r[1] for r in conn.execute("PRAGMA table_info(findings)").fetchall()}
+                if "commit_sha" not in finding_cols:
+                    conn.execute("ALTER TABLE findings ADD COLUMN commit_sha TEXT DEFAULT '';")
+                if "span_hash" not in finding_cols:
+                    conn.execute("ALTER TABLE findings ADD COLUMN span_hash TEXT DEFAULT '';")
+                conn.execute("PRAGMA user_version = 2;")
         finally:
             conn.close()
 
@@ -940,6 +978,34 @@ class AuditDB:
             return "in_progress"
         return "reviewed" if current_status == "in_progress" else current_status
 
+    def _calibrate_system_health(
+        self,
+        conn: sqlite3.Connection,
+        system_id: str,
+        asserted_health: Optional[int],
+    ) -> Optional[int]:
+        """Calibrate and clamp health score to prevent systems with unresolved Critical/High findings from asserting misleadingly high scores."""
+        if asserted_health is None:
+            return None
+        rows = conn.execute(
+            """
+            SELECT severity, COUNT(*) AS cnt
+            FROM findings
+            WHERE system_id = ? AND status NOT IN ('resolved', 'wont_fix')
+            GROUP BY severity
+            """,
+            (system_id,),
+        ).fetchall()
+        sev_counts = {r["severity"]: r["cnt"] for r in rows}
+        score = asserted_health
+        if sev_counts.get("critical", 0) > 0:
+            score = min(score, 65)
+        elif sev_counts.get("high", 0) > 0:
+            score = min(score, 75)
+        elif sev_counts.get("medium", 0) > 0:
+            score = min(score, 85)
+        return score
+
     def upsert_system(
         self,
         project_id: str,
@@ -1007,7 +1073,8 @@ class AuditDB:
                 new_status = self._compute_post_audit_system_status(
                     conn, sid, existing["status"], status
                 )
-                new_health = validated_health if validated_health is not None else existing["health_score"]
+                raw_health = validated_health if validated_health is not None else existing["health_score"]
+                new_health = self._calibrate_system_health(conn, sid, raw_health)
                 last_by = aid or existing["last_audited_by"]
                 last_at = now if aid else existing["last_audited_at"]
 
@@ -1048,6 +1115,7 @@ class AuditDB:
                 sid = system_id or short_id("sys")
                 inferred_type = system_type or ("subsystem" if parent_id else "system")
                 init_status = status or "unreviewed"
+                init_health = self._calibrate_system_health(conn, sid, validated_health)
                 conn.execute(
                     """
                     INSERT INTO systems (
@@ -1068,7 +1136,7 @@ class AuditDB:
                         description or "",
                         details or "",
                         init_status,
-                        validated_health,
+                        init_health,
                         aid,
                         now if aid else None,
                         now,
@@ -1186,7 +1254,8 @@ class AuditDB:
             new_status = self._compute_post_audit_system_status(
                 conn, sys_obj["id"], sys_obj["status"], status
             )
-            new_health = validated_health if validated_health is not None else sys_obj["health_score"]
+            raw_health = validated_health if validated_health is not None else sys_obj["health_score"]
+            new_health = self._calibrate_system_health(conn, sys_obj["id"], raw_health)
             new_details = sys_obj["details"] or ""
             if details_append:
                 sep = "\n\n" if new_details else ""
@@ -2069,6 +2138,8 @@ class AuditDB:
                     computed_status = self._compute_post_audit_system_status(
                         conn, t["system_id"], sys_row["status"], system_status
                     )
+                    raw_health = validated_health if validated_health is not None else sys_row["health_score"]
+                    new_health = self._calibrate_system_health(conn, t["system_id"], raw_health)
                     should_release_sys = 1 if (effective_agent is not None and remaining_agent_tasks == 0) else 0
                     # Only clear system lease if effective_agent is NOT NULL, owns the system lease, and has 0 remaining tasks on it (RF-07, RF-08)
                     conn.execute(
@@ -2078,7 +2149,7 @@ class AuditDB:
                             claimed_at = CASE WHEN ? = 1 AND claimed_by = ? THEN NULL ELSE claimed_at END,
                             lease_until = CASE WHEN ? = 1 AND claimed_by = ? THEN NULL ELSE lease_until END,
                             status = ?,
-                            health_score = COALESCE(?, health_score),
+                            health_score = ?,
                             last_audited_by = COALESCE(?, last_audited_by),
                             last_audited_at = ?,
                             updated_at = ?
@@ -2089,7 +2160,7 @@ class AuditDB:
                             should_release_sys, effective_agent,
                             should_release_sys, effective_agent,
                             computed_status,
-                            validated_health,
+                            new_health,
                             effective_agent,
                             now,
                             now,
@@ -2179,6 +2250,9 @@ class AuditDB:
         details: str = "",
         file_path: str = "",
         line_range: str = "",
+        commit_sha: str = "",
+        span_hash: str = "",
+        code_snippet: str = "",
         recommendation: str = "",
         status: str = "open",
     ) -> Dict[str, Any]:
@@ -2216,15 +2290,26 @@ class AuditDB:
                 if not trow:
                     raise ValueError(f"Task '{task_id}' not found in project '{project_id}'.")
 
+            # Evidence reconstruction & provenance
+            final_commit_sha = (commit_sha or "").strip()
+            if not final_commit_sha:
+                p_row = conn.execute("SELECT root_path FROM projects WHERE id = ?", (project_id,)).fetchone()
+                root_p = p_row["root_path"] if p_row else None
+                final_commit_sha = get_git_commit_sha(root_p)
+
+            final_span_hash = (span_hash or "").strip()
+            if not final_span_hash and code_snippet:
+                final_span_hash = compute_span_hash(code_snippet)
+
             fid = short_id("find")
             conn.execute(
                 """
                 INSERT INTO findings (
                     id, project_id, system_id, related_system_id, task_id, agent_id,
                     severity, category, status, title, description, details,
-                    file_path, line_range, recommendation, created_at, updated_at
+                    file_path, line_range, commit_sha, span_hash, recommendation, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fid,
@@ -2241,6 +2326,8 @@ class AuditDB:
                     details,
                     file_path,
                     line_range,
+                    final_commit_sha,
+                    final_span_hash,
                     recommendation,
                     now,
                     now,
@@ -2248,14 +2335,18 @@ class AuditDB:
             )
 
             if system_id and norm_sev in ("critical", "high") and norm_status not in ("resolved", "wont_fix"):
+                cur_health_row = conn.execute("SELECT health_score FROM systems WHERE id = ?", (system_id,)).fetchone()
+                cur_health = cur_health_row["health_score"] if cur_health_row else None
+                calibrated_health = self._calibrate_system_health(conn, system_id, cur_health)
                 conn.execute(
                     """
                     UPDATE systems
                     SET status = 'needs_attention',
+                        health_score = ?,
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (now, system_id),
+                    (calibrated_health, now, system_id),
                 )
 
             self._log_event(
@@ -2608,6 +2699,13 @@ class AuditDB:
                 if f.get("file_path"):
                     loc = f"{f['file_path']}:{f['line_range']}" if f.get("line_range") else f["file_path"]
                     lines.append(f"- **Location**: `{loc}`")
+                if f.get("commit_sha") or f.get("span_hash"):
+                    ev_items = []
+                    if f.get("commit_sha"):
+                        ev_items.append(f"commit `{f['commit_sha'][:8]}`")
+                    if f.get("span_hash"):
+                        ev_items.append(f"span `{f['span_hash'][:10]}`")
+                    lines.append(f"- **Reconstruction Key**: {', '.join(ev_items)}")
                 if f.get("description"):
                     lines.append(f"- **Summary**: {f['description']}")
                 if f.get("details"):
@@ -3297,6 +3395,7 @@ class AuditDB:
         project_id: str,
         system_ref: str,
         created_by: Optional[str] = None,
+        include_verification: bool = True,
     ) -> List[Dict[str, Any]]:
         """Automatically scaffold standard multi-disciplinary audit tasks for a system/subsystem."""
         pid = self.resolve_project_id(project_id)
@@ -3330,6 +3429,15 @@ class AuditDB:
                 f"Document inbound/outbound relations, schema contracts (gRPC/REST/Kafka), retry backoff, and circuit breaker behavior.",
             ),
         ]
+        if include_verification:
+            standard_pack.append(
+                (
+                    f"Verify findings, edge cases & test quality for {sname}",
+                    "verification",
+                    "medium",
+                    f"Verify and reproduce logged findings, inspect test suite coverage/mutations, and sign off on subsystem health for {sname}.",
+                )
+            )
 
         created_tasks = []
         with self.connect() as conn:
@@ -3589,7 +3697,7 @@ class AuditDB:
         now = utc_now_iso()
         actions_taken = []
 
-        with self.connect(immediate=auto_fix) as conn:
+        with self.connect() as conn:
             proj = conn.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
             if not proj:
                 raise ValueError(f"Project '{pid}' not found.")
@@ -3618,12 +3726,6 @@ class AuditDB:
                             "lease_until": t.get("lease_until"),
                             "reason": "Offline agent" if is_offline else "Lease expired",
                         })
-                        if auto_fix:
-                            conn.execute(
-                                "UPDATE tasks SET status = 'open', claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ? WHERE id = ?",
-                                (now, t["id"]),
-                            )
-                            actions_taken.append(f"Reopened stalled task '{t['title']}' ({t['id']})")
 
             for s in systems:
                 if s.get("claimed_by"):
@@ -3654,7 +3756,13 @@ class AuditDB:
                 if t.get("system_id"):
                     tasks_by_system.setdefault(t["system_id"], []).append(t)
 
-            standard_types = {"architecture_map", "security_review", "performance_review", "integration_trace"}
+            standard_types = {
+                "architecture_map",
+                "security_review",
+                "performance_review",
+                "integration_trace",
+                "verification",
+            }
             for s in systems:
                 sys_tasks = tasks_by_system.get(s["id"], [])
                 existing_types = {t["task_type"] for t in sys_tasks}
@@ -3727,25 +3835,47 @@ class AuditDB:
                         "health_score": s.get("health_score"),
                         "open_findings": len(sys_findings),
                     })
-                    if auto_fix:
-                        conn.execute(
-                            "UPDATE systems SET status = ?, updated_at = ? WHERE id = ?",
-                            (calibrated_status, now, s["id"]),
-                        )
-                        actions_taken.append(f"Signed off system '{s['name']}' ({s['slug']}) -> {calibrated_status}")
 
-            if auto_fix and unscaffolded:
+        if auto_fix:
+            with self.connect(immediate=True) as conn:
+                for z in zombies:
+                    if z["type"] == "task":
+                        conn.execute(
+                            "UPDATE tasks SET status = 'open', claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ? WHERE id = ?",
+                            (now, z["id"]),
+                        )
+                        actions_taken.append(f"Reopened stalled task '{z['title']}' ({z['id']})")
+                    elif z["type"] == "system":
+                        conn.execute(
+                            "UPDATE systems SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ? WHERE id = ?",
+                            (now, z["id"]),
+                        )
+                        actions_taken.append(f"Released stalled claim on system '{z['name']}' ({z['slug']})")
+
+                for s in ready_for_signoff:
+                    conn.execute(
+                        "UPDATE systems SET status = ?, updated_at = ? WHERE id = ?",
+                        (s["calibrated_status"], now, s["system_id"]),
+                    )
+                    actions_taken.append(f"Signed off system '{s['name']}' ({s['slug']}) -> {s['calibrated_status']}")
+
+                if actions_taken:
+                    self._log_event(
+                        conn,
+                        pid,
+                        agent_id or "audit-lead",
+                        "sweep.executed",
+                        "project",
+                        pid,
+                        f"Audit sweep executed with {len(actions_taken)} remediation actions.",
+                        {"actions": actions_taken},
+                    )
+
+            if unscaffolded:
                 for entry in unscaffolded:
                     created = self.scaffold_system_tasks(pid, entry["slug"], created_by=agent_id or "audit-lead")
                     if created:
                         actions_taken.append(f"Scaffolded {len(created)} tasks for system '{entry['name']}'")
-
-            if actions_taken:
-                self._log_event(
-                    conn, pid, agent_id or "audit-lead", "sweep.executed", "project", pid,
-                    f"Audit sweep executed with {len(actions_taken)} remediation actions.",
-                    {"actions": actions_taken},
-                )
 
         return {
             "project": proj_dict,

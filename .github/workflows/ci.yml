@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test Suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run Unit Tests
+        run: |
+          python3 -m unittest discover -s tests -v
+
+      - name: CLI Sanity Check
+        run: |
+          chmod +x audit
+          ./audit init --project "ci-test" --name "CI Test Run" --json
+          ./audit agent register --id "ci-agent" --name "CI Runner" --role "audit-lead" --json
+          ./audit system add --name "Test Gateway" --slug "test-gw" --desc "CI smoke test" --json
+          ./audit task scaffold --system "test-gw" --json
+          ./audit board --json
+          ./audit sweep --json

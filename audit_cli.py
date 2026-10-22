@@ -212,6 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_task_scaffold = task_sub.add_parser("scaffold", parents=[sub_global], help="Auto-scaffold standard multi-disciplinary audit tasks for a system/subsystem")
     p_task_scaffold.add_argument("--system", required=True, help="Target system/subsystem ID, slug, or name")
+    p_task_scaffold.add_argument("--no-verification", action="store_true", help="Scaffold only the 4 initial audit tasks, omitting verification")
 
     # finding commands
     p_find = subparsers.add_parser("finding", parents=[sub_global], help="Log and manage audit findings, bugs, and architectural risks")
@@ -226,6 +227,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_find_add.add_argument("--task", default=None, help="Optional task ID under which this was found")
     p_find_add.add_argument("--file", default="", help="File path in codebase")
     p_find_add.add_argument("--lines", default="", help="Line range (e.g., 120-165)")
+    p_find_add.add_argument("--commit-sha", default="", help="Git commit SHA when finding was observed")
+    p_find_add.add_argument("--span-hash", default="", help="Cryptographic hash of the code span (or auto-computed)")
+    p_find_add.add_argument("--snippet", default="", help="Code snippet for computing content span hash")
     p_find_add.add_argument("--desc", default="", help="Summary description of the issue")
     p_find_add.add_argument("--details", default="", help="Deep technical explanation, reproduction, or root cause")
     p_find_add.add_argument("--recommendation", default="", help="Concrete remediation steps")
@@ -941,6 +945,7 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
                     project_id=pid,
                     system_ref=args.system,
                     created_by=args.agent,
+                    include_verification=not getattr(args, "no_verification", False),
                 )
                 db.sync_static_snapshot(pid)
                 lines = [
@@ -970,19 +975,26 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
                     details=args.details,
                     file_path=args.file,
                     line_range=args.lines,
+                    commit_sha=getattr(args, "commit_sha", ""),
+                    span_hash=getattr(args, "span_hash", ""),
+                    code_snippet=getattr(args, "snippet", ""),
                     recommendation=args.recommendation,
                 )
                 db.sync_static_snapshot(pid)
-                print_output(
-                    f,
-                    args.json,
-                    [
-                        f"Logged Finding {f['id']} [{f['severity'].upper()} / {f['category']}]: {f['title']}",
-                        f"  System:   {f.get('system_name') or 'Project-wide'}",
-                        f"  Location: {f['file_path'] or '-'}{':' + f['line_range'] if f.get('line_range') else ''}",
-                        f"  Agent:    {f.get('agent_id') or 'unspecified'} at {f['created_at']}",
-                    ],
-                )
+                out_lines = [
+                    f"Logged Finding {f['id']} [{f['severity'].upper()} / {f['category']}]: {f['title']}",
+                    f"  System:   {f.get('system_name') or 'Project-wide'}",
+                    f"  Location: {f['file_path'] or '-'}{':' + f['line_range'] if f.get('line_range') else ''}",
+                    f"  Agent:    {f.get('agent_id') or 'unspecified'} at {f['created_at']}",
+                ]
+                if f.get("commit_sha") or f.get("span_hash"):
+                    ev_desc = []
+                    if f.get("commit_sha"):
+                        ev_desc.append(f"commit {f['commit_sha'][:8]}")
+                    if f.get("span_hash"):
+                        ev_desc.append(f"span {f['span_hash'][:10]}")
+                    out_lines.append(f"  Evidence: {', '.join(ev_desc)}")
+                print_output(f, args.json, out_lines)
                 return 0
 
             if args.find_cmd == "update":

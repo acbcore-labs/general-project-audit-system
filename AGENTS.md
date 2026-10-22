@@ -137,17 +137,18 @@ When mapping a codebase and finding an unmapped system or subsystem, register it
 ```bash
 ./audit task scaffold --system "edge-rate-limiter"
 ```
-This automatically queues the 4 standard review tasks for the system:
+This automatically queues the 5 standard review tasks covering all blackboard disciplines:
 1. `[architecture_map]` Map boundaries, components & path scope
 2. `[security_review]` Audit authentication, data boundaries & permissions
 3. `[performance_review]` Review latency, async concurrency & throughput
 4. `[integration_trace]` Trace cross-system contracts, protocols & failure modes
+5. `[verification]` Verify findings, edge cases, test quality & sign-off subsystem health
 
 ---
 
 ## 6. Logging Findings & Completing Tasks
 
-### Logging a Finding
+### Logging a Finding (With Cryptographic Provenance)
 ```bash
 ./audit finding add \
   --title "Non-atomic refresh token check permits parallel token minting" \
@@ -157,6 +158,7 @@ This automatically queues the 4 standard review tasks for the system:
   --related-system "edge-gateway" \
   --file "services/identity/src/tokens/refresh_store.rs" \
   --lines "142-189" \
+  --commit-sha "a1b2c3d4" \
   --desc "Separate SELECT and UPDATE statements allow concurrent requests to pass revocation checks." \
   --details "Under 4ms latency spikes, parallel mobile retries mint two valid JWT token pairs." \
   --recommendation "Wrap the check-and-mint in an atomic SQL statement or Redis distributed lock."
