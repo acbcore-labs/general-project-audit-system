@@ -756,28 +756,44 @@ class TestAuditOSRemediation(unittest.TestCase):
         )
         self.assertTrue(len(f1["span_hash"]) > 0)
 
-        # 3. Setup a zombie task and system claimed by agent-zombie
+        # Force uncorrected state: in_progress with health 90, 1 completed task, 0 claimed/open tasks, and open high finding
+        # to guarantee the sweep auto-fix sign-off UPDATE path actually executes and goes through StatusGovernor & HealthCalibrator
+        with self.db.connect(immediate=True) as conn:
+            conn.execute(
+                "UPDATE systems SET status = 'in_progress', health_score = 90 WHERE id = ?",
+                (sid,),
+            )
+
+        # 3. Setup a separate system with a zombie task and system claim to test lease reaper independently
+        z_sys = self.db.upsert_system(
+            project_id=pid,
+            name="Stalled Reconciliation Service",
+            slug="stalled-reconciliation",
+            health_score=80,
+            status="in_progress",
+        )
+        z_sid = z_sys["id"]
         zombie_agent = self.db.register_agent(agent_id="agent-zombie", name="Zombie Agent", project_id=pid)
         z_task = self.db.create_task(
             project_id=pid,
             title="Stalled reconciliation task",
-            system_ref=sid,
+            system_ref=z_sid,
             claim_immediately_for="agent-zombie",
         )
         # Manually expire the lease in the past for both task and system
         past_iso = "2020-01-01T00:00:00.000Z"
         with self.db.connect(immediate=True) as conn:
             conn.execute("UPDATE tasks SET lease_until = ? WHERE id = ?", (past_iso, z_task["id"]))
-            conn.execute("UPDATE systems SET lease_until = ? WHERE id = ?", (past_iso, sid))
-            conn.execute("UPDATE agents SET current_task_id = ?, current_system_id = ? WHERE id = ?", (z_task["id"], sid, "agent-zombie"))
+            conn.execute("UPDATE systems SET lease_until = ? WHERE id = ?", (past_iso, z_sid))
+            conn.execute("UPDATE agents SET current_task_id = ?, current_system_id = ? WHERE id = ?", (z_task["id"], z_sid, "agent-zombie"))
 
-        # Add a duplicate finding with identical span_hash
+        # Add a duplicate finding with identical span_hash on z_sid
         f2 = self.db.add_finding(
             project_id=pid,
             title="Another finding with exact same snippet",
             severity="high",
             category="performance",
-            system_ref=sid,
+            system_ref=z_sid,
             file_path="src/ledger/different_file.py",
             line_range="100-115",
             code_snippet="def round_amount(x): return float(x)",  # same snippet -> same span_hash
@@ -792,6 +808,12 @@ class TestAuditOSRemediation(unittest.TestCase):
         dup_entry = next((d for d in sweep_res["duplicates"] if d["span_hash"] == f1["span_hash"]), None)
         self.assertIsNotNone(dup_entry)
         self.assertIn("span_hash", dup_entry["reason"])
+
+        # Verify sign-off write actually executed in auto-fix
+        signoff_actions = [a for a in sweep_res["actions_taken"] if f"Signed off system '{sys_obj['name']}'" in a]
+        self.assertEqual(len(signoff_actions), 1)
+        self.assertIn("needs_attention", signoff_actions[0])
+        self.assertIn("health: 75", signoff_actions[0])
 
         # 5. INVARIANT: System CANNOT be painted healthy! Status MUST be needs_attention, health clamped <= 75
         updated_sys = self.db.get_system(pid, sid)

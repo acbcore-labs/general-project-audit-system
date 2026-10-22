@@ -209,7 +209,65 @@ The sweep engine automatically:
 
 ---
 
-## 8. Command Reference Cheat-Sheet
+## 8. Audit Sprint Close-Out Procedure
+
+Closing out an audit sprint is a lead-agent and human-driven workflow; AuditOS intentionally does **not** provide an automatic project-wide finalization controller or magic `finalize` command. Furthermore, **"audit complete" does not mean "all defects are fixed" or "the system is healthy"**—it means all components across all required disciplines have been systematically reviewed, evidence has been captured, and remaining risks are explicitly categorized and disclosed.
+
+Follow this verified multi-step close-out sequence:
+
+### 1. Drain & Release Active Worker Claims
+Ensure no agent holds stalled in-flight claims. Active workers must either complete tasks or release them cleanly:
+```bash
+# Agent completing assigned deliverable
+./audit task complete <task-id> --agent "$AUDIT_AGENT_ID" --summary "Completed review"
+
+# Or releasing active claims before ending an agent session
+./audit revert --agent "$AUDIT_AGENT_ID" --reason "Shift handoff / session complete"
+```
+
+### 2. Inspect Project-Wide Coverage Matrix
+An empty task queue for an individual agent does not indicate project completion. Inspect the global mission blackboard and status across all 5 disciplines:
+```bash
+./audit board
+./audit status
+```
+Verify whether any systems remain unassigned, pending, or in progress.
+
+### 3. Run a Dry Sweep First
+Before signing off, run a dry-run orchestrator sweep to inspect queue health, detect lingering leases, and review sign-off candidates:
+```bash
+./audit sweep
+```
+
+### 4. Apply Sweep Remediations & Re-Inspect
+When appropriate, apply fixes. Note that `--fix` can reap zombie leases (reopening tasks) or scaffold missing discipline tasks on newly discovered systems, so you must always re-inspect the board afterward:
+```bash
+# Apply fixes (reap zombies, sign off completed subsystems)
+./audit sweep --fix
+
+# Re-inspect blackboard to verify no reopened or newly scaffolded tasks remain open
+./audit board
+```
+
+### 5. Categorize, Defer, or Disclose Remaining Findings
+Any open findings must be triaged. If defects cannot be remediated within the audit window, ensure they are recorded with explicit severities and recommendations so stakeholders have complete visibility:
+```bash
+./audit finding list --status open
+```
+
+### 6. Export the Final Audit Deliverable
+Generate the immutable audit report containing complete component hierarchy, blackboard matrices, finding ledgers with cryptographic provenance (commit SHA and code snippet span hashes), and the chronological audit log:
+```bash
+# Export readable Markdown report to disk
+./audit export --format md --output AUDIT_REPORT.md
+
+# Or stream JSON for programmatic downstream pipelines
+./audit export --json > audit_deliverable.json
+```
+
+---
+
+## 9. Command Reference Cheat-Sheet
 
 | Action | Command |
 | :--- | :--- |
@@ -225,5 +283,5 @@ The sweep engine automatically:
 | **Register Agent** | `./audit agent register --id <id> --role <role>` |
 | **Log Finding** | `./audit finding add --title "..." --severity critical` |
 | **Complete Task** | `./audit task complete <id> --summary "..."` |
-| **Start Web UI & REST Server** | `./audit serve` |
+| **Export Audit Report** | `./audit export --format md --output <path>` |
 | **Start Web UI & REST Server** | `./audit serve` |
