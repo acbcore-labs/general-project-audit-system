@@ -49,6 +49,34 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     subparsers.add_parser("status", parents=[sub_global], help="Show overall audit status, coverage metrics, and workforce summary")
 
+    # board
+    subparsers.add_parser("board", parents=[sub_global], help="Show live multi-agent mission blackboard & coverage matrix")
+
+    # resume & revert
+    p_resume = subparsers.add_parser("resume", parents=[sub_global], help="Resume an interrupted agent session, extend leases, and restore working context")
+    p_resume.add_argument("--lease", type=int, default=30, help="Minutes to extend active leases")
+
+    p_revert = subparsers.add_parser("revert", parents=[sub_global], help="Release all active task/system claims held by an agent and return them to the queue")
+    p_revert.add_argument("--reason", default="Aborted by agent", help="Reason for releasing claims")
+
+    # checkpoint
+    p_chk = subparsers.add_parser("checkpoint", parents=[sub_global], help="Save, show, or list agent progress checkpoints and scratchpad notes")
+    chk_sub = p_chk.add_subparsers(dest="chk_cmd")
+
+    p_chk_save = chk_sub.add_parser("save", parents=[sub_global], help="Save draft notes, progress state, or partial findings")
+    p_chk_save.add_argument("--notes", default="", help="Markdown or text notes")
+    p_chk_save.add_argument("--title", default="", help="Checkpoint title")
+    p_chk_save.add_argument("--data", default=None, help="JSON-serialized state object")
+    p_chk_save.add_argument("--task", default=None, help="Task ID (defaults to agent's current task)")
+    p_chk_save.add_argument("--system", default=None, help="System slug or ID (defaults to agent's current system)")
+    p_chk_save.add_argument("--type", default="scratchpad", choices=["scratchpad", "draft_finding", "progress_state", "artifact"], help="Checkpoint type")
+
+    p_chk_show = chk_sub.add_parser("show", parents=[sub_global], help="Show latest checkpoint for an agent")
+    p_chk_show.add_argument("--task", default=None, help="Optional task ID")
+
+    p_chk_list = chk_sub.add_parser("list", parents=[sub_global], help="List checkpoints")
+    p_chk_list.add_argument("--task", default=None, help="Optional task ID filter")
+
     # seed-demo & reset
     subparsers.add_parser("seed-demo", parents=[sub_global], help="Seed database with a realistic multi-system, multi-agent audit demo")
     subparsers.add_parser("reset", parents=[sub_global], help="Clear all audit records and reset the database")
@@ -84,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent_hb.add_argument("--lease", type=int, default=30, help="Minutes to extend active leases")
 
     agent_sub.add_parser("list", parents=[sub_global], help="List all registered agents and their current claims")
+    agent_sub.add_parser("roster", parents=[sub_global], help="Show canonical role matrix, active staffing, and vacant specialties")
 
     # system commands
     p_sys = subparsers.add_parser("system", parents=[sub_global], help="Map and inspect systems and hierarchical subsystems")
@@ -173,6 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_task_list.add_argument("--status", default=None, choices=["open", "claimed", "completed", "blocked"])
     p_task_list.add_argument("--system", default=None, help="Filter by system/subsystem")
     p_task_list.add_argument("--claimed-by", default=None, help="Filter by assigned agent ID")
+
+    p_task_scaffold = task_sub.add_parser("scaffold", parents=[sub_global], help="Auto-scaffold standard multi-disciplinary audit tasks for a system/subsystem")
+    p_task_scaffold.add_argument("--system", required=True, help="Target system/subsystem ID, slug, or name")
 
     # finding commands
     p_find = subparsers.add_parser("finding", parents=[sub_global], help="Log and manage audit findings, bugs, and architectural risks")
@@ -285,6 +317,160 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
             print_output(snap["metrics"], args.json, lines)
             return 0
 
+        if args.command == "board":
+            b = db.get_blackboard(args.project)
+            p = b["project"]
+            r = b["roster"]
+            m = b["matrix"]
+            lines = [
+                f"=== AUDIT MISSION BLACKBOARD: {p['name']} ({p['id']}) ===",
+                f"Workforce: {r['total_active_agents']} active agent(s) | Vacant roles: {', '.join(r['vacant_roles']) or 'None (Fully Staffed)'}",
+                "",
+                "SYSTEM / SUBSYSTEM                      HEALTH   ARCH   SEC    PERF   INTEG  VERIFY  CLAIM / AGENT",
+                "─" * 96,
+            ]
+            symbol_map = {
+                "completed": "✅",
+                "in_progress": "⏳",
+                "blocked": "❌",
+                "pending": "📋",
+                "documented": "🔗",
+                "unassigned": "—",
+            }
+            for row in m:
+                pfx = " └── " if row.get("parent_id") else ""
+                name_disp = f"{pfx}{row['name']} ({row['slug']})"[:38].ljust(38)
+                health_disp = f"{row['health_score']}/100" if row["health_score"] is not None else " unscored"
+                health_disp = health_disp.center(8)
+                f = row["facets"]
+                arch_s = symbol_map.get(f["arch"]["status"], "—").center(6)
+                sec_s = symbol_map.get(f["sec"]["status"], "—").center(6)
+                perf_s = symbol_map.get(f["perf"]["status"], "—").center(6)
+                integ_s = symbol_map.get(f["integ"]["status"], "—").center(6)
+                ver_s = symbol_map.get(f["verify"]["status"], "—").center(6)
+                claim_str = f"@{row['claimed_by']}" if row.get("claimed_by") else "[Unclaimed]"
+                if row.get("critical_findings_count", 0) > 0:
+                    claim_str += f" ({row['critical_findings_count']} CRIT finding!)"
+                lines.append(f"{name_disp} {health_disp} {arch_s} {sec_s} {perf_s} {integ_s} {ver_s}  {claim_str}")
+
+            lines.append("─" * 96)
+            lines.append("Legend: ✅ Completed | ⏳ In-Progress | 📋 Pending/Claimable | ❌ Blocked | 🔗 Documented | — Unassigned")
+            if b["recommendations"]:
+                lines.append("\nRecommended Next Actions:")
+                for rec in b["recommendations"]:
+                    lines.append(f"  * {rec}")
+            print_output(b, args.json, lines)
+            return 0
+
+        if args.command == "resume":
+            aid = args.agent
+            if not aid:
+                raise ValueError("Specify agent ID via --agent or $AUDIT_AGENT_ID to resume session.")
+            pid = db.resolve_project_id(args.project) if args.project else None
+            res = db.resume_agent(agent_id=aid, project_id=pid, extend_leases_minutes=args.lease)
+            lines = [
+                f"=== Resumed Session for Agent: {res['agent']['name']} ({aid}) ===",
+                f"Role:         {res['agent']['role']} (status: {res['agent']['status']})",
+                f"Lease:        Extended active leases by {res['lease_extended_minutes']} minutes",
+            ]
+            if res.get("active_task"):
+                t = res["active_task"]
+                lines.append(f"Active Task:  [{t['id']}] {t['title']} (Priority: {t['priority']}, System: {t.get('system_slug') or 'Project'})")
+                lines.append(f"  Lease Until: {t.get('lease_until')}")
+            else:
+                lines.append("Active Task:  (none claimed)")
+
+            if res.get("active_system"):
+                s = res["active_system"]
+                lines.append(f"Active System: {s['name']} ({s['slug']}) — Lease Until: {s.get('lease_until')}")
+
+            if res.get("latest_checkpoint"):
+                c = res["latest_checkpoint"]
+                lines.append(f"Latest Checkpoint: '{c.get('title')}' ({c['created_at']})")
+                if c.get("content"):
+                    lines.append(f"  Notes: {c['content']}")
+
+            lines.append(f"\nNext Action: {res['next_action']}")
+            print_output(res, args.json, lines)
+            return 0
+
+        if args.command == "revert":
+            aid = args.agent
+            if not aid:
+                raise ValueError("Specify agent ID via --agent or $AUDIT_AGENT_ID to revert claims.")
+            pid = db.resolve_project_id(args.project) if args.project else None
+            rev = db.revert_agent(agent_id=aid, project_id=pid, reason=args.reason)
+            lines = [
+                f"Reverted Claims for Agent '{aid}':",
+                f"  Reverted Tasks:   {', '.join(rev['reverted_tasks']) or 'None'}",
+                f"  Reverted Systems: {', '.join(rev['reverted_systems']) or 'None'}",
+                f"  Reason:           {rev['reason']}",
+                f"  Agent Status:     {rev['status']}",
+            ]
+            print_output(rev, args.json, lines)
+            return 0
+
+        if args.command == "checkpoint":
+            pid = db.resolve_project_id(args.project) if args.project else None
+            if args.chk_cmd == "save":
+                aid = args.agent
+                if not aid:
+                    raise ValueError("Specify agent ID via --agent or $AUDIT_AGENT_ID to save checkpoint.")
+                data_dict = json.loads(args.data) if getattr(args, "data", None) else {}
+                chk = db.save_checkpoint(
+                    project_id=pid,
+                    agent_id=aid,
+                    content=args.notes or "",
+                    title=args.title or "Progress Checkpoint",
+                    state_json=data_dict,
+                    task_id=args.task,
+                    system_id=args.system,
+                    checkpoint_type=args.type,
+                )
+                print_output(
+                    chk,
+                    args.json,
+                    [
+                        f"Saved Checkpoint {chk['id']} for Agent '{aid}':",
+                        f"  Title:      {chk['title']}",
+                        f"  Type:       {chk['checkpoint_type']}",
+                        f"  Task/Sys:   {chk.get('task_id') or '-'} / {chk.get('system_id') or '-'}",
+                        f"  Created At: {chk['created_at']}",
+                    ],
+                )
+                return 0
+
+            if args.chk_cmd == "show":
+                aid = args.agent
+                if not aid:
+                    raise ValueError("Specify agent ID via --agent or $AUDIT_AGENT_ID to show checkpoint.")
+                chk = db.get_agent_checkpoint(agent_id=aid, task_id=args.task)
+                if not chk:
+                    print_output({"checkpoint": None}, args.json, ["No checkpoint found."])
+                else:
+                    lines = [
+                        f"=== Checkpoint: {chk['title']} ({chk['id']}) ===",
+                        f"Agent:       {chk['agent_id']}",
+                        f"Created At:  {chk['created_at']}",
+                        f"Type:        {chk['checkpoint_type']}",
+                        f"Task:        {chk.get('task_id') or '-'}",
+                        f"System:      {chk.get('system_id') or '-'}",
+                        f"Notes/Draft: {chk.get('content') or '-'}",
+                    ]
+                    if chk.get("state_json") and chk["state_json"] != "{}":
+                        lines.append(f"State JSON:  {chk['state_json']}")
+                    print_output(chk, args.json, lines)
+                return 0
+
+            if args.chk_cmd == "list":
+                chks = db.list_checkpoints(project_id=pid, agent_id=args.agent, task_id=args.task)
+                lines = [
+                    f"- [{c['created_at']}] {c['id']} (@{c['agent_id']}) [{c['checkpoint_type']}]: {c['title']} | task:{c.get('task_id') or '-'}"
+                    for c in chks
+                ]
+                print_output(chks, args.json, lines or ["No checkpoints recorded."])
+                return 0
+
         if args.command == "export":
             # Honor both --format json and global --json flag when exporting to stdout (RF-17)
             use_json_format = args.format == "json" or (args.json and not args.output)
@@ -378,6 +564,26 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
                         f"last seen: {a['last_heartbeat']}{active_str}"
                     )
                 print_output(agents, args.json, lines or ["No agents registered."])
+                return 0
+
+            if args.agent_cmd == "roster":
+                pid = db.resolve_project_id(args.project) if args.project else None
+                r = db.list_roles(pid)
+                lines = [
+                    "=== Multi-Agent Workforce Roster & Role Matrix ===",
+                    f"Active Agents: {r['total_active_agents']} | Vacant Canonical Roles: {len(r['vacant_roles'])}",
+                    "",
+                ]
+                for role in r["roles"]:
+                    vac_str = "[VACANT]" if role["is_vacant"] else f"[{role['active_agents']} active]"
+                    agent_names = ", ".join(f"@{a['id']}" for a in role["agents"] if a["status"] == "active") or "None"
+                    task_types_str = ", ".join(role["task_types"]) or "any"
+                    lines.append(f"- {role['role']} — {role['title']} {vac_str}")
+                    lines.append(f"  Description: {role['description']}")
+                    lines.append(f"  Target Tasks: {task_types_str}")
+                    lines.append(f"  Active Staff: {agent_names}")
+                    lines.append("")
+                print_output(r, args.json, lines)
                 return 0
 
         # SYSTEM SUBCOMMANDS
@@ -669,6 +875,23 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
                     for t in tasks
                 ]
                 print_output(tasks, args.json, lines or ["No tasks found."])
+                return 0
+
+            if args.task_cmd == "scaffold":
+                created = db.scaffold_system_tasks(
+                    project_id=pid,
+                    system_ref=args.system,
+                    created_by=args.agent,
+                )
+                db.sync_static_snapshot(pid)
+                lines = [
+                    f"Scaffolded {len(created)} standard audit tasks for system '{args.system}':",
+                ]
+                for t in created:
+                    lines.append(f"  + [{t['task_type']}] {t['title']} ({t['priority']}) [ID: {t['id']}]")
+                if not created:
+                    lines.append("  (All standard audit task types already exist for this system.)")
+                print_output(created, args.json, lines)
                 return 0
 
         # FINDING SUBCOMMANDS

@@ -198,11 +198,42 @@ Verify your hierarchy at any time:
 
 To run multiple AI agents (e.g., Claude Code, Gemini CLI, Cursor, Codex, or custom Python workers) in parallel against the same repository:
 
-1. **Share [`AGENT_GUIDE.md`](../AGENT_GUIDE.md)** with each agent and assign each a distinct `AUDIT_AGENT_ID` and specialty role:
-   - **Worker 1 (`agent-arch-01`)**: Maps top-level systems, subsystems, and cross-system relations, then seeds `audit task add` items for each component.
-   - **Worker 2 (`agent-sec-02`)**: Loops over `./audit task next --type security_review --agent agent-sec-02 --json`, inspects code, logs security findings, and completes tasks.
-   - **Worker 3 (`agent-perf-03`)**: Loops over `./audit task next --type performance_review --agent agent-perf-03 --json`, audits concurrency/database queries, and logs reliability/performance findings.
-2. **Keep Leases Alive on Long Tasks**:
+1. **Share [`AGENTS.md`](../AGENTS.md)** with each agent. Have them check the active roster and pick a specialized role from the canonical taxonomy:
+   ```bash
+   ./audit agent roster
+   ```
+   - **`arch-mapper`**: Maps systems, subsystem boundaries, and scaffolds standard task suites (`./audit task scaffold --system <slug>`).
+   - **`security-auditor`**: Focuses on auth, tokens, crypto, injection, and authorization boundaries.
+   - **`performance-reviewer`**: Audits database locks, async contention, N+1 queries, and latency.
+   - **`integration-tracer`**: Traces protocols, contracts, and cascading failure modes between systems.
+   - **`verifier`**: Verifies reported findings, reproduces edge cases, and tests test quality.
+
+2. **Inspect the Live Mission Blackboard**:
+   Any agent or human can run `./audit board` (or `curl http://127.0.0.1:8420/api/board`) to inspect system coverage across all 5 review disciplines (Arch, Sec, Perf, Integ, Verify) and claimable tasks.
+
+3. **Role-Aware Atomic Task Claiming**:
+   Agents simply run:
+   ```bash
+   ./audit task next --agent "$AUDIT_AGENT_ID" --json
+   ```
+   The engine automatically prioritizes open tasks matching the agent's registered role, avoiding task stampedes.
+
+4. **Saving Checkpoints & Resuming Work Seamlessly**:
+   - Save intermediate scratch notes or partial findings:
+     ```bash
+     ./audit checkpoint save --agent "$AUDIT_AGENT_ID" --notes "Tracing line 142 race condition"
+     ```
+   - If an agent crashes or stops, it resumes in one step:
+     ```bash
+     ./audit resume --agent "$AUDIT_AGENT_ID"
+     ```
+     This automatically restores active task context, renews leases, and displays saved notes.
+   - If an agent must abort, it releases all claims cleanly:
+     ```bash
+     ./audit revert --agent "$AUDIT_AGENT_ID" --reason "Context exhausted"
+     ```
+
+5. **Keep Leases Alive on Long Tasks**:
    - Each task or system claim grants a **30-minute lease** by default (`--lease 30`).
    - Agents performing long analyses can refresh their lease with:
      ```bash

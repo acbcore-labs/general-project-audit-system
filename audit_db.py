@@ -64,6 +64,61 @@ VALID_PRIORITIES = ("critical", "high", "medium", "low")
 VALID_SEVERITIES = ("critical", "high", "medium", "low", "info")
 VALID_SYSTEM_STATUSES = ("unreviewed", "in_progress", "reviewed", "needs_attention", "healthy")
 VALID_TASK_STATUSES = ("open", "claimed", "completed", "blocked")
+VALID_AGENT_ROLES = (
+    "arch-mapper",
+    "security-auditor",
+    "performance-reviewer",
+    "integration-tracer",
+    "verifier",
+    "general-auditor",
+)
+
+ROLE_METADATA: Dict[str, Dict[str, Any]] = {
+    "arch-mapper": {
+        "title": "Architecture & Scope Mapper",
+        "description": "Maps system/subsystem hierarchy, path scopes, architectural boundaries, and baseline component health.",
+        "task_types": ("architecture_map", "subsystem_audit"),
+        "capabilities": ("ast", "directory-mapping", "hierarchy", "scoping"),
+    },
+    "security-auditor": {
+        "title": "Security & Invariants Auditor",
+        "description": "Audits authentication, RBAC, input validation, cryptographic primitives, secrets, and authorization boundaries.",
+        "task_types": ("security_review", "bug_hunt"),
+        "capabilities": ("auth", "jwt", "crypto", "sql-injection", "rbac", "secrets"),
+    },
+    "performance-reviewer": {
+        "title": "Performance & Concurrency Reviewer",
+        "description": "Audits database queries, N+1 patterns, async bottlenecks, race conditions, memory leaks, and throughput budgets.",
+        "task_types": ("performance_review",),
+        "capabilities": ("concurrency", "async", "database-queries", "benchmarking", "latency"),
+    },
+    "integration-tracer": {
+        "title": "Cross-System Integration Tracer",
+        "description": "Traces relations, protocols (gRPC, REST, Kafka), contract coupling, and cascading failure modes between systems.",
+        "task_types": ("integration_trace",),
+        "capabilities": ("cross-system", "protocols", "contracts", "events", "grpc", "rest"),
+    },
+    "verifier": {
+        "title": "Quality & Verification Prover",
+        "description": "Verifies logged findings, reproduces edge cases, checks test suite quality, and signs off on subsystem health scores.",
+        "task_types": ("verification", "bug_hunt"),
+        "capabilities": ("verification", "testing", "reproduction", "regression", "mutation"),
+    },
+    "general-auditor": {
+        "title": "General Purpose Auditor",
+        "description": "Generalist auditor capable of executing any open audit task across the project.",
+        "task_types": (
+            "architecture_map",
+            "subsystem_audit",
+            "integration_trace",
+            "security_review",
+            "performance_review",
+            "bug_hunt",
+            "verification",
+        ),
+        "capabilities": ("general",),
+    },
+}
 
 
 SCHEMA_SQL = """
@@ -207,6 +262,24 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_checkpoints (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    task_id TEXT DEFAULT NULL,
+    system_id TEXT DEFAULT NULL,
+    checkpoint_type TEXT NOT NULL DEFAULT 'scratchpad', -- scratchpad, draft_finding, progress_state, artifact
+    title TEXT DEFAULT '',
+    content TEXT DEFAULT '',
+    state_json TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL,
+    FOREIGN KEY (system_id) REFERENCES systems(id) ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_systems_project ON systems(project_id);
 CREATE INDEX IF NOT EXISTS idx_systems_parent ON systems(parent_id);
 CREATE INDEX IF NOT EXISTS idx_relations_project ON system_relations(project_id);
@@ -216,6 +289,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status)
 CREATE INDEX IF NOT EXISTS idx_findings_project_severity ON findings(project_id, severity);
 CREATE INDEX IF NOT EXISTS idx_findings_system ON findings(system_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_project_time ON audit_logs(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_agent ON agent_checkpoints(agent_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON agent_checkpoints(task_id);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_system ON agent_checkpoints(system_id);
 """
 
 
@@ -323,6 +399,40 @@ class AuditDB:
                     conn.execute("ALTER TABLE tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3;")
                 if "blocked_reason" not in task_cols:
                     conn.execute("ALTER TABLE tasks ADD COLUMN blocked_reason TEXT DEFAULT '';")
+                has_checkpoints = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='agent_checkpoints'"
+                ).fetchone()
+                if not has_checkpoints:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS agent_checkpoints (
+                            id TEXT PRIMARY KEY,
+                            project_id TEXT NOT NULL,
+                            agent_id TEXT NOT NULL,
+                            task_id TEXT DEFAULT NULL,
+                            system_id TEXT DEFAULT NULL,
+                            checkpoint_type TEXT NOT NULL DEFAULT 'scratchpad',
+                            title TEXT DEFAULT '',
+                            content TEXT DEFAULT '',
+                            state_json TEXT DEFAULT '{}',
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                            FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+                            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL,
+                            FOREIGN KEY (system_id) REFERENCES systems(id) ON DELETE SET NULL
+                        );
+                        """
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_checkpoints_agent ON agent_checkpoints(agent_id, updated_at DESC);"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON agent_checkpoints(task_id);"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_checkpoints_system ON agent_checkpoints(system_id);"
+                    )
         finally:
             conn.close()
 
@@ -1675,6 +1785,36 @@ class AuditDB:
             if task_type:
                 filters += " AND t.task_type = ?"
                 params.append(task_type)
+            elif aid:
+                # Role-aware dispatching: if agent has a specialized role, prioritize its matched task types
+                agent_row = conn.execute("SELECT role FROM agents WHERE id = ?", (aid,)).fetchone()
+                if agent_row and agent_row["role"] in ROLE_METADATA and agent_row["role"] != "general-auditor":
+                    target_types = ROLE_METADATA[agent_row["role"]]["task_types"]
+                    placeholders = ",".join(["?"] * len(target_types))
+                    check_params = [project_id, now, aid, now] + list(target_types)
+                    has_role_tasks = conn.execute(
+                        f"""
+                        SELECT 1
+                        FROM tasks t
+                        LEFT JOIN systems s ON t.system_id = s.id
+                        WHERE t.project_id = ?
+                          AND (t.status = 'open' OR (t.status = 'claimed' AND t.lease_until IS NOT NULL AND t.lease_until < ?))
+                          AND t.attempt_count < t.max_attempts
+                          AND (
+                              t.system_id IS NULL
+                              OR s.claimed_by IS NULL
+                              OR s.claimed_by = ?
+                              OR s.lease_until IS NULL
+                              OR s.lease_until < ?
+                          )
+                          AND t.task_type IN ({placeholders})
+                        LIMIT 1
+                        """,
+                        check_params,
+                    ).fetchone()
+                    if has_role_tasks:
+                        filters += f" AND t.task_type IN ({placeholders})"
+                        params.extend(target_types)
             if system_ref:
                 sys_obj = self._resolve_system_in_conn(conn, project_id, system_ref)
                 if not sys_obj:
@@ -2945,3 +3085,480 @@ class AuditDB:
             self.auto_sync_snapshot = prev_sync
             if self.auto_sync_snapshot:
                 self.sync_static_snapshot(pid)
+
+    def list_roles(self, project_id: Optional[str] = None) -> Dict[str, Any]:
+        """List canonical agent roles, descriptions, target task types, and currently active agents per role."""
+        with self.connect() as conn:
+            query = "SELECT role, status, id, name FROM agents"
+            params: List[Any] = []
+            if project_id:
+                query += " WHERE project_id = ? OR project_id IS NULL"
+                params.append(project_id)
+            rows = conn.execute(query, params).fetchall()
+
+        role_occupancy: Dict[str, List[Dict[str, str]]] = {r: [] for r in VALID_AGENT_ROLES}
+        custom_roles: Dict[str, List[Dict[str, str]]] = {}
+        for r in rows:
+            role_name = r["role"]
+            agent_item = {"id": r["id"], "name": r["name"], "status": r["status"]}
+            if role_name in role_occupancy:
+                role_occupancy[role_name].append(agent_item)
+            else:
+                custom_roles.setdefault(role_name, []).append(agent_item)
+
+        roles_list = []
+        for role_slug, meta in ROLE_METADATA.items():
+            assigned = role_occupancy.get(role_slug, [])
+            active_count = sum(1 for a in assigned if a["status"] == "active")
+            roles_list.append({
+                "role": role_slug,
+                "title": meta["title"],
+                "description": meta["description"],
+                "task_types": list(meta["task_types"]),
+                "capabilities": list(meta["capabilities"]),
+                "active_agents": active_count,
+                "total_agents": len(assigned),
+                "agents": assigned,
+                "is_vacant": active_count == 0,
+            })
+
+        for custom_slug, assigned in custom_roles.items():
+            active_count = sum(1 for a in assigned if a["status"] == "active")
+            roles_list.append({
+                "role": custom_slug,
+                "title": f"Custom Role ({custom_slug})",
+                "description": "User-defined or specialized worker role.",
+                "task_types": [],
+                "capabilities": [],
+                "active_agents": active_count,
+                "total_agents": len(assigned),
+                "agents": assigned,
+                "is_vacant": active_count == 0,
+            })
+
+        return {
+            "canonical_roles": list(VALID_AGENT_ROLES),
+            "roles": roles_list,
+            "total_active_agents": sum(r["active_agents"] for r in roles_list),
+            "vacant_roles": [r["role"] for r in roles_list if r["is_vacant"] and r["role"] in VALID_AGENT_ROLES],
+        }
+
+    def get_blackboard(self, project_ref: Optional[str] = None) -> Dict[str, Any]:
+        """Generate a unified multi-agent blackboard showing systems x review facets, claims, and open work."""
+        pid = self.resolve_project_id(project_ref)
+        with self.connect() as conn:
+            proj = conn.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
+            if not proj:
+                raise ValueError(f"Project '{pid}' not found.")
+            proj_dict = dict(proj)
+
+            systems = [dict(r) for r in conn.execute(
+                """
+                SELECT s.*,
+                       p.slug AS parent_slug, p.name AS parent_name
+                FROM systems s
+                LEFT JOIN systems p ON s.parent_id = p.id
+                WHERE s.project_id = ?
+                ORDER BY s.parent_id IS NOT NULL, s.name ASC
+                """,
+                (pid,),
+            ).fetchall()]
+
+            tasks = [dict(r) for r in conn.execute(
+                """
+                SELECT t.*, a.name AS claimed_by_name, a.role AS claimed_by_role
+                FROM tasks t
+                LEFT JOIN agents a ON t.claimed_by = a.id
+                WHERE t.project_id = ?
+                """,
+                (pid,),
+            ).fetchall()]
+
+            findings = [dict(r) for r in conn.execute(
+                "SELECT * FROM findings WHERE project_id = ?",
+                (pid,),
+            ).fetchall()]
+
+            relations = [dict(r) for r in conn.execute(
+                "SELECT * FROM system_relations WHERE project_id = ?",
+                (pid,),
+            ).fetchall()]
+
+        matrix = []
+        for s in systems:
+            sid = s["id"]
+            sys_tasks = [t for t in tasks if t["system_id"] == sid]
+            sys_findings = [f for f in findings if f["system_id"] == sid or f.get("related_system_id") == sid]
+            sys_rels = [r for r in relations if r["source_system_id"] == sid or r["target_system_id"] == sid]
+
+            def facet_status(types: tuple) -> Dict[str, Any]:
+                matching_done = [t for t in sys_tasks if t["task_type"] in types and t["status"] == "completed"]
+                matching_claimed = [t for t in sys_tasks if t["task_type"] in types and t["status"] == "claimed"]
+                matching_open = [t for t in sys_tasks if t["task_type"] in types and t["status"] == "open"]
+                matching_blocked = [t for t in sys_tasks if t["task_type"] in types and t["status"] == "blocked"]
+                if matching_done:
+                    status = "completed"
+                elif matching_claimed:
+                    status = "in_progress"
+                elif matching_blocked:
+                    status = "blocked"
+                elif matching_open:
+                    status = "pending"
+                else:
+                    status = "unassigned"
+                return {
+                    "status": status,
+                    "completed_count": len(matching_done),
+                    "open_count": len(matching_open) + len(matching_claimed),
+                }
+
+            facets = {
+                "arch": facet_status(("architecture_map", "subsystem_audit")),
+                "sec": facet_status(("security_review", "bug_hunt")),
+                "perf": facet_status(("performance_review",)),
+                "integ": facet_status(("integration_trace",)),
+                "verify": facet_status(("verification",)),
+            }
+            if facets["integ"]["status"] == "unassigned" and sys_rels:
+                facets["integ"]["status"] = "documented"
+
+            open_crit_findings = sum(1 for f in sys_findings if f["severity"] == "critical" and f["status"] == "open")
+            open_high_findings = sum(1 for f in sys_findings if f["severity"] == "high" and f["status"] == "open")
+
+            matrix.append({
+                "id": sid,
+                "slug": s["slug"],
+                "name": s["name"],
+                "system_type": s["system_type"],
+                "parent_id": s["parent_id"],
+                "parent_slug": s.get("parent_slug"),
+                "path_scope": s.get("path_scope") or "",
+                "status": s["status"],
+                "health_score": s["health_score"],
+                "claimed_by": s.get("claimed_by"),
+                "lease_until": s.get("lease_until"),
+                "facets": facets,
+                "relations_count": len(sys_rels),
+                "open_findings_count": len([f for f in sys_findings if f["status"] == "open"]),
+                "critical_findings_count": open_crit_findings,
+                "high_findings_count": open_high_findings,
+            })
+
+        roster = self.list_roles(pid)
+
+        open_tasks = [
+            {
+                "id": t["id"],
+                "title": t["title"],
+                "priority": t["priority"],
+                "task_type": t["task_type"],
+                "system_id": t["system_id"],
+                "created_at": t["created_at"],
+            }
+            for t in tasks if t["status"] == "open"
+        ]
+
+        recommendations = []
+        unreviewed = [m["name"] for m in matrix if m["status"] == "unreviewed"]
+        if unreviewed:
+            recommendations.append(f"{len(unreviewed)} components unreviewed ({', '.join(unreviewed[:3])}{'...' if len(unreviewed) > 3 else ''}). Run 'audit task scaffold --system <slug>'.")
+        if roster["vacant_roles"]:
+            recommendations.append(f"Vacant roles needing agents: {', '.join(roster['vacant_roles'])}.")
+        crit_sys = [m["name"] for m in matrix if m["critical_findings_count"] > 0]
+        if crit_sys:
+            recommendations.append(f"Critical findings requiring verification in: {', '.join(crit_sys[:3])}.")
+
+        return {
+            "project": proj_dict,
+            "roster": roster,
+            "matrix": matrix,
+            "open_tasks": open_tasks,
+            "total_open_tasks": len(open_tasks),
+            "recommendations": recommendations,
+        }
+
+    def scaffold_system_tasks(
+        self,
+        project_id: str,
+        system_ref: str,
+        created_by: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Automatically scaffold standard multi-disciplinary audit tasks for a system/subsystem."""
+        pid = self.resolve_project_id(project_id)
+        sys_obj = self.get_system(pid, system_ref)
+        sname = sys_obj["name"]
+        sid = sys_obj["id"]
+
+        standard_pack = [
+            (
+                f"Map boundaries, components & path scope for {sname}",
+                "architecture_map",
+                "high",
+                f"Inspect source directory ({sys_obj.get('path_scope') or 'codebase'}), catalog internal modules, and verify subsystem hierarchy.",
+            ),
+            (
+                f"Audit authentication, data boundaries & permissions for {sname}",
+                "security_review",
+                "critical",
+                f"Check RBAC, input sanitization, token validation, cryptographic invariants, and secret exposure for {sname}.",
+            ),
+            (
+                f"Review latency, async concurrency & throughput for {sname}",
+                "performance_review",
+                "medium",
+                f"Check database query patterns, async deadlock risks, resource cleanup, and rate limiting for {sname}.",
+            ),
+            (
+                f"Trace cross-system contracts, protocols & failure modes for {sname}",
+                "integration_trace",
+                "high",
+                f"Document inbound/outbound relations, schema contracts (gRPC/REST/Kafka), retry backoff, and circuit breaker behavior.",
+            ),
+        ]
+
+        created_tasks = []
+        with self.connect() as conn:
+            existing_tasks = [dict(r) for r in conn.execute(
+                "SELECT task_type FROM tasks WHERE project_id = ? AND system_id = ? AND status IN ('open', 'claimed')",
+                (pid, sid),
+            ).fetchall()]
+            existing_types = {t["task_type"] for t in existing_tasks}
+
+        for title, ttype, prio, desc in standard_pack:
+            if ttype in existing_types:
+                continue
+            task = self.create_task(
+                project_id=pid,
+                title=title,
+                system_ref=sid,
+                task_type=ttype,
+                priority=prio,
+                description=desc,
+                created_by=created_by,
+            )
+            created_tasks.append(task)
+
+        return created_tasks
+
+    def save_checkpoint(
+        self,
+        project_id: Optional[str] = None,
+        agent_id: str = "",
+        content: str = "",
+        title: str = "",
+        state_json: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        system_id: Optional[str] = None,
+        checkpoint_type: str = "scratchpad",
+    ) -> Dict[str, Any]:
+        """Save intermediate progress, scratch notes, or audit state for an agent session."""
+        aid = validate_identifier(agent_id, "agent_id")
+        now = utc_now_iso()
+        cid = short_id("chk")
+        with self.connect(immediate=True) as conn:
+            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (aid,)).fetchone()
+            if not agent:
+                raise ValueError(f"Agent '{aid}' is not registered.")
+            pid = self.resolve_project_id(project_id or agent["project_id"])
+            tid = task_id or agent["current_task_id"]
+            sid = system_id or agent["current_system_id"]
+            raw_state = json.dumps(state_json or {})
+
+            conn.execute(
+                """
+                INSERT INTO agent_checkpoints (
+                    id, project_id, agent_id, task_id, system_id,
+                    checkpoint_type, title, content, state_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (cid, pid, aid, tid, sid, checkpoint_type, title or "Checkpoint", content, raw_state, now, now),
+            )
+            self._log_event(
+                conn, pid, aid, "checkpoint.saved", "agent_checkpoint", cid,
+                f"Agent '{aid}' saved checkpoint '{title or 'Checkpoint'}'",
+                {"task_id": tid, "system_id": sid, "checkpoint_type": checkpoint_type},
+            )
+            row = conn.execute("SELECT * FROM agent_checkpoints WHERE id = ?", (cid,)).fetchone()
+            return dict(row)
+
+    def get_agent_checkpoint(
+        self,
+        agent_id: str,
+        task_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest checkpoint or scratchpad for an agent."""
+        aid = validate_identifier(agent_id, "agent_id")
+        with self.connect() as conn:
+            if task_id:
+                row = conn.execute(
+                    "SELECT * FROM agent_checkpoints WHERE agent_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (aid, task_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM agent_checkpoints WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (aid,),
+                ).fetchone()
+            return dict(row) if row else None
+
+    def list_checkpoints(
+        self,
+        project_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List checkpoints matching optional filters."""
+        params: List[Any] = []
+        clauses = []
+        if project_id:
+            pid = self.resolve_project_id(project_id)
+            clauses.append("project_id = ?")
+            params.append(pid)
+        if agent_id:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM agent_checkpoints {where} ORDER BY created_at DESC LIMIT {int(limit)}",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def resume_agent(
+        self,
+        agent_id: str,
+        project_id: Optional[str] = None,
+        extend_leases_minutes: int = 30,
+    ) -> Dict[str, Any]:
+        """Resume an agent session, extend unexpired leases, and restore working context."""
+        aid = validate_identifier(agent_id, "agent_id")
+        now = utc_now_iso()
+        with self.connect(immediate=True) as conn:
+            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (aid,)).fetchone()
+            if not agent:
+                raise ValueError(f"Agent '{aid}' is not registered.")
+            pid = self.resolve_project_id(project_id or agent["project_id"])
+
+            # Heartbeat & extend active leases
+            conn.execute(
+                "UPDATE agents SET status = 'active', last_heartbeat = ? WHERE id = ?",
+                (now, aid),
+            )
+            lease_until = future_utc_iso(extend_leases_minutes)
+            conn.execute(
+                "UPDATE tasks SET lease_until = ?, updated_at = ? WHERE claimed_by = ? AND status = 'claimed' AND (lease_until IS NULL OR lease_until >= ?)",
+                (lease_until, now, aid, now),
+            )
+            conn.execute(
+                "UPDATE systems SET lease_until = ?, updated_at = ? WHERE claimed_by = ? AND (lease_until IS NULL OR lease_until >= ?)",
+                (lease_until, now, aid, now),
+            )
+
+            # Fetch claimed task & system
+            current_task = None
+            if agent["current_task_id"]:
+                task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (agent["current_task_id"],)).fetchone()
+                if task_row and task_row["claimed_by"] == aid and task_row["status"] == "claimed":
+                    current_task = dict(task_row)
+                    if current_task.get("system_id"):
+                        sys_row = conn.execute("SELECT slug, name FROM systems WHERE id = ?", (current_task["system_id"],)).fetchone()
+                        if sys_row:
+                            current_task["system_slug"] = sys_row["slug"]
+                            current_task["system_name"] = sys_row["name"]
+
+            current_system = None
+            if agent["current_system_id"]:
+                sys_row = conn.execute("SELECT * FROM systems WHERE id = ?", (agent["current_system_id"],)).fetchone()
+                if sys_row and sys_row["claimed_by"] == aid:
+                    current_system = dict(sys_row)
+
+            # Latest checkpoint
+            chk_row = conn.execute(
+                "SELECT * FROM agent_checkpoints WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1",
+                (aid,),
+            ).fetchone()
+            latest_checkpoint = dict(chk_row) if chk_row else None
+
+            # Next suggested action
+            if current_task:
+                next_action = f"Continue working on task {current_task['id']} ('{current_task['title']}'). Lease valid until {current_task.get('lease_until')}."
+            elif current_system:
+                next_action = f"Continue reviewing system '{current_system['name']}' ({current_system['slug']}). Claimed until {current_system.get('lease_until')}."
+            else:
+                next_action = f"No active tasks claimed. Run './audit task next --agent {aid}' to claim the next priority task for role '{agent['role']}'."
+
+            return {
+                "agent": dict(agent),
+                "active_task": current_task,
+                "active_system": current_system,
+                "latest_checkpoint": latest_checkpoint,
+                "lease_extended_minutes": extend_leases_minutes,
+                "next_action": next_action,
+            }
+
+    def revert_agent(
+        self,
+        agent_id: str,
+        project_id: Optional[str] = None,
+        reason: str = "Aborted by agent",
+    ) -> Dict[str, Any]:
+        """Cleanly release any active tasks and systems claimed by this agent and return them to the queue."""
+        aid = validate_identifier(agent_id, "agent_id")
+        now = utc_now_iso()
+        with self.connect(immediate=True) as conn:
+            agent = conn.execute("SELECT * FROM agents WHERE id = ?", (aid,)).fetchone()
+            if not agent:
+                raise ValueError(f"Agent '{aid}' is not registered.")
+            pid = self.resolve_project_id(project_id or agent["project_id"])
+
+            reverted_tasks = []
+            claimed_tasks = conn.execute(
+                "SELECT id, title FROM tasks WHERE claimed_by = ? AND status = 'claimed'",
+                (aid,),
+            ).fetchall()
+            for ct in claimed_tasks:
+                conn.execute(
+                    "UPDATE tasks SET status = 'open', claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ? WHERE id = ?",
+                    (now, ct["id"]),
+                )
+                reverted_tasks.append(ct["id"])
+                self._log_event(
+                    conn, pid, aid, "task.reverted", "task", ct["id"],
+                    f"Agent '{aid}' reverted task '{ct['title']}' back to open queue ({reason})",
+                )
+
+            reverted_systems = []
+            claimed_systems = conn.execute(
+                "SELECT id, slug, name FROM systems WHERE claimed_by = ?",
+                (aid,),
+            ).fetchall()
+            for cs in claimed_systems:
+                conn.execute(
+                    "UPDATE systems SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ? WHERE id = ?",
+                    (now, cs["id"]),
+                )
+                reverted_systems.append(cs["slug"])
+                self._log_event(
+                    conn, pid, aid, "system.released", "system", cs["id"],
+                    f"Agent '{aid}' released claim on '{cs['name']}' ({reason})",
+                )
+
+            conn.execute(
+                "UPDATE agents SET current_task_id = NULL, current_system_id = NULL, status = 'idle', last_heartbeat = ? WHERE id = ?",
+                (now, aid),
+            )
+
+            return {
+                "agent_id": aid,
+                "status": "idle",
+                "reverted_tasks": reverted_tasks,
+                "reverted_systems": reverted_systems,
+                "reason": reason,
+            }

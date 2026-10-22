@@ -452,6 +452,115 @@ class TestAuditOSRemediation(unittest.TestCase):
             exported_json = json.loads(buf.getvalue())
             self.assertEqual(exported_json["project"]["name"], "CLI Project")
 
+    def test_multi_agent_coordination_blackboard_and_checkpoints(self) -> None:
+        """Verify role taxonomy, role-aware task dispatch, mission blackboard, task scaffolding, and checkpoints."""
+        proj = self.db.create_project(name="Mission Board Test", root_path="/test")
+        pid = proj["id"]
+
+        # Register specialized agents
+        sec_agent = self.db.register_agent(agent_id="sec-01", name="Security Agent", role="security-auditor", project_id=pid)
+        arch_agent = self.db.register_agent(agent_id="arch-01", name="Arch Agent", role="arch-mapper", project_id=pid)
+
+        # Verify role roster
+        roster = self.db.list_roles(pid)
+        self.assertEqual(roster["total_active_agents"], 2)
+        self.assertIn("performance-reviewer", roster["vacant_roles"])
+        self.assertNotIn("security-auditor", roster["vacant_roles"])
+
+        # Add systems
+        sys_obj1 = self.db.upsert_system(project_id=pid, name="Payment Core", slug="payment-core", system_type="service")
+        sys_obj2 = self.db.upsert_system(project_id=pid, name="Auth Service", slug="auth-service", system_type="service")
+
+        # Auto-scaffold standard multi-disciplinary audit tasks
+        scaffolded1 = self.db.scaffold_system_tasks(pid, "payment-core", created_by="arch-01")
+        self.assertEqual(len(scaffolded1), 4)
+        types = {t["task_type"] for t in scaffolded1}
+        self.assertEqual(types, {"architecture_map", "security_review", "performance_review", "integration_trace"})
+
+        scaffolded2 = self.db.scaffold_system_tasks(pid, "auth-service", created_by="arch-01")
+        self.assertEqual(len(scaffolded2), 4)
+
+        # Role-aware dispatch: security-auditor should claim security_review
+        sec_task = self.db.claim_next_task(project_id=pid, agent_id="sec-01")
+        self.assertIsNotNone(sec_task)
+        self.assertEqual(sec_task["task_type"], "security_review")
+        self.assertEqual(sec_task["claimed_by"], "sec-01")
+
+        # Role-aware dispatch: arch-mapper should claim architecture_map on an available system
+        arch_task = self.db.claim_next_task(project_id=pid, agent_id="arch-01")
+        self.assertIsNotNone(arch_task)
+        self.assertEqual(arch_task["task_type"], "architecture_map")
+        self.assertEqual(arch_task["claimed_by"], "arch-01")
+
+        # Save checkpoint / scratchpad for sec-01
+        chk = self.db.save_checkpoint(
+            project_id=pid,
+            agent_id="sec-01",
+            title="Analyzing payment auth headers",
+            content="Found missing signature validation on webhook callbacks.",
+            state_json={"step": 2, "verified": False},
+        )
+        self.assertEqual(chk["agent_id"], "sec-01")
+        self.assertEqual(chk["task_id"], sec_task["id"])
+
+        # Fetch latest checkpoint
+        latest_chk = self.db.get_agent_checkpoint("sec-01")
+        self.assertIsNotNone(latest_chk)
+        self.assertEqual(latest_chk["title"], "Analyzing payment auth headers")
+
+        # Resume agent session
+        res = self.db.resume_agent("sec-01", project_id=pid)
+        self.assertEqual(res["active_task"]["id"], sec_task["id"])
+        self.assertEqual(res["latest_checkpoint"]["id"], chk["id"])
+        self.assertIn("Continue working on task", res["next_action"])
+
+        # Test mission blackboard
+        board = self.db.get_blackboard(pid)
+        self.assertEqual(len(board["matrix"]), 2)
+        payment_row = next(r for r in board["matrix"] if r["slug"] == "payment-core")
+        auth_row = next(r for r in board["matrix"] if r["slug"] == "auth-service")
+        self.assertEqual(payment_row["facets"]["sec"]["status"], "in_progress")
+        self.assertEqual(payment_row["facets"]["arch"]["status"], "pending")
+        self.assertEqual(auth_row["facets"]["arch"]["status"], "in_progress")
+
+        # Revert agent claims cleanly
+        rev = self.db.revert_agent("sec-01", project_id=pid, reason="Pause for lunch")
+        self.assertEqual(rev["status"], "idle")
+        self.assertIn(sec_task["id"], rev["reverted_tasks"])
+
+        # Verify task is reopened
+        open_task = self.db.get_project_snapshot(pid)["tasks"]
+        sec_reopened = next(t for t in open_task if t["id"] == sec_task["id"])
+        self.assertEqual(sec_reopened["status"], "open")
+        self.assertIsNone(sec_reopened["claimed_by"])
+
+        # Test HTTP REST endpoints for board, roles, checkpoints, scaffold, resume, revert
+        h_board = MockRequestHandler(self.db, "GET", f"/api/board?project={pid}")
+        h_board.do_GET()
+        self.assertEqual(h_board.status_code, 200)
+        self.assertEqual(len(h_board.get_json()["matrix"]), 2)
+
+        h_roles = MockRequestHandler(self.db, "GET", f"/api/roles?project={pid}")
+        h_roles.do_GET()
+        self.assertEqual(h_roles.status_code, 200)
+        self.assertEqual(h_roles.get_json()["total_active_agents"], 1)  # arch-01 is active, sec-01 is idle
+
+        h_chks = MockRequestHandler(self.db, "GET", f"/api/checkpoints?project={pid}&agent=sec-01")
+        h_chks.do_GET()
+        self.assertEqual(h_chks.status_code, 200)
+        self.assertEqual(len(h_chks.get_json()["checkpoints"]), 1)
+
+        h_resume = MockRequestHandler(
+            self.db,
+            "POST",
+            "/api/resume",
+            headers_dict={"Content-Type": "application/json"},
+            body_bytes=json.dumps({"agent_id": "arch-01", "project_id": pid}).encode("utf-8"),
+        )
+        h_resume.do_POST()
+        self.assertEqual(h_resume.status_code, 200)
+        self.assertEqual(h_resume.get_json()["active_task"]["id"], arch_task["id"])
+
 
 if __name__ == "__main__":
     unittest.main()

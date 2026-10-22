@@ -162,6 +162,32 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(snap)
                 return
 
+            if path == "/api/board":
+                project_ref = q1("project")
+                board = self.db.get_blackboard(project_ref)
+                self._send_json(board)
+                return
+
+            if path == "/api/roles":
+                pid = self.db.resolve_project_id(q1("project")) if q1("project") else None
+                self._send_json(self.db.list_roles(pid))
+                return
+
+            if path == "/api/checkpoints":
+                pid = self.db.resolve_project_id(q1("project")) if q1("project") else None
+                limit = int(q1("limit", "50") or "50")
+                self._send_json(
+                    {
+                        "checkpoints": self.db.list_checkpoints(
+                            project_id=pid,
+                            agent_id=q1("agent"),
+                            task_id=q1("task"),
+                            limit=limit,
+                        )
+                    }
+                )
+                return
+
             if path == "/api/projects":
                 self._send_json({"projects": self.db.list_projects()})
                 return
@@ -435,6 +461,60 @@ class AuditRequestHandler(BaseHTTPRequestHandler):
                     force=bool(body.get("force", False)),
                 )
                 self._send_json(task)
+                return
+
+            if path == "/api/tasks/scaffold":
+                pid = self.db.resolve_project_id(body.get("project_id"))
+                tasks = self.db.scaffold_system_tasks(
+                    project_id=pid,
+                    system_ref=body["system_ref"],
+                    created_by=agent_id,
+                )
+                self._send_json({"scaffolded_tasks": tasks}, status=201)
+                return
+
+            if path == "/api/resume":
+                target_agent = body.get("agent_id") or agent_id
+                if not target_agent:
+                    raise ValueError("agent_id is required to resume session.")
+                pid = self.db.resolve_project_id(body.get("project_id")) if body.get("project_id") else None
+                res = self.db.resume_agent(
+                    agent_id=target_agent,
+                    project_id=pid,
+                    extend_leases_minutes=int(body.get("lease_minutes", 30)),
+                )
+                self._send_json(res)
+                return
+
+            if path == "/api/revert":
+                target_agent = body.get("agent_id") or agent_id
+                if not target_agent:
+                    raise ValueError("agent_id is required to revert claims.")
+                pid = self.db.resolve_project_id(body.get("project_id")) if body.get("project_id") else None
+                rev = self.db.revert_agent(
+                    agent_id=target_agent,
+                    project_id=pid,
+                    reason=body.get("reason", "Aborted by agent"),
+                )
+                self._send_json(rev)
+                return
+
+            if path == "/api/checkpoints":
+                target_agent = body.get("agent_id") or agent_id
+                if not target_agent:
+                    raise ValueError("agent_id is required to save checkpoint.")
+                pid = self.db.resolve_project_id(body.get("project_id")) if body.get("project_id") else None
+                chk = self.db.save_checkpoint(
+                    project_id=pid,
+                    agent_id=target_agent,
+                    content=body.get("content", ""),
+                    title=body.get("title", "Progress Checkpoint"),
+                    state_json=body.get("state_json") or {},
+                    task_id=body.get("task_id"),
+                    system_id=body.get("system_id"),
+                    checkpoint_type=body.get("checkpoint_type", "scratchpad"),
+                )
+                self._send_json(chk, status=201)
                 return
 
             if path == "/api/findings":
